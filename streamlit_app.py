@@ -15,7 +15,7 @@ from reportlab.lib.units import inch
 st.set_page_config(page_title="VastuSense Demo", layout="wide")
 
 # ---- Fixed settings (hidden) ----
-MODEL = "gpt-4o-mini"
+MODEL = "gpt-4o"
 MAX_OUTPUT_TOKENS = 1800
 
 client = OpenAI()  # uses OPENAI_API_KEY from env / Streamlit secrets
