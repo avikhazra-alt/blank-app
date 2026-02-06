@@ -6,20 +6,14 @@ from openai import OpenAI
 
 st.set_page_config(page_title="Prompt Sandbox", layout="wide")
 
+# ---- Fixed settings (not shown in UI) ----
+MODEL = "gpt-4o-mini"
+MAX_OUTPUT_TOKENS = 1200
+
 st.title("📎 Upload → Prompt → Output")
 st.caption("Upload a PDF or image, enter a prompt, and get text output on the UI.")
 
-# --- Sidebar controls ---
-with st.sidebar:
-    st.header("Settings")
-    model = st.text_input("Model", value="gpt-4o-mini")
-    max_output_tokens = st.slider("Max output tokens", 200, 4000, 1200, 100)
-    st.markdown("---")
-    if st.button("🧹 Clear output"):
-        st.session_state["out"] = ""
-        st.session_state["err"] = ""
-
-# --- State ---
+# Session state
 st.session_state.setdefault("out", "")
 st.session_state.setdefault("err", "")
 
@@ -34,7 +28,7 @@ with col1:
     if uploaded:
         name = uploaded.name.lower()
         if name.endswith(".pdf"):
-            st.info(f"📄 PDF uploaded: **{uploaded.name}** ({uploaded.size} bytes)")
+            st.info(f"📄 PDF uploaded: **{uploaded.name}**")
         else:
             st.image(uploaded, caption=uploaded.name, use_container_width=True)
 
@@ -42,27 +36,31 @@ with col2:
     st.subheader("2) Prompt")
     prompt = st.text_area(
         "What should I do with this file?",
-        placeholder="Examples:\n- Summarize this PDF in 5 bullets\n- Extract key data into JSON\n- Describe the image and list visible text\n- Identify errors/issues in the document",
+        placeholder="Examples:\n- Summarize this PDF in 5 bullets\n- Extract key data\n- Describe the image and list visible text",
         height=180,
     )
 
-    run = st.button("▶️ Run", type="primary", use_container_width=True)
+    c1, c2 = st.columns([1, 1])
+    run = c1.button("▶️ Run", type="primary", use_container_width=True)
+    clear = c2.button("🧹 Clear", use_container_width=True)
 
-# --- Processing ---
+if clear:
+    st.session_state["out"] = ""
+    st.session_state["err"] = ""
+
 def run_openai(uploaded_file, prompt_text):
     filename = uploaded_file.name
     file_bytes = uploaded_file.getvalue()
     mime = uploaded_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
-    # PDF: upload to Files API, then reference via input_file
     if filename.lower().endswith(".pdf"):
         f = io.BytesIO(file_bytes)
         f.name = filename
         up = client.files.create(file=f, purpose="user_data")
 
         resp = client.responses.create(
-            model=model,
-            max_output_tokens=max_output_tokens,
+            model=MODEL,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
             input=[{
                 "role": "user",
                 "content": [
@@ -73,13 +71,13 @@ def run_openai(uploaded_file, prompt_text):
         )
         return resp.output_text
 
-    # Image: send base64 data URL with input_image
+    # image
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     data_url = f"data:{mime};base64,{b64}"
 
     resp = client.responses.create(
-        model=model,
-        max_output_tokens=max_output_tokens,
+        model=MODEL,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
         input=[{
             "role": "user",
             "content": [
@@ -89,7 +87,6 @@ def run_openai(uploaded_file, prompt_text):
         }],
     )
     return resp.output_text
-
 
 if run:
     st.session_state["err"] = ""
