@@ -1,60 +1,150 @@
 import io
+import re
 import base64
 import mimetypes
+from datetime import datetime
+
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="Vastu Floor Plan Sandbox", layout="centered")
+# PDF generation (simple, clean)
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
 
-# ---- Fixed settings (not shown in UI) ----
+st.set_page_config(page_title="VastuSense Demo", layout="wide")
+
+# ---- Fixed settings (hidden) ----
 MODEL = "gpt-4o-mini"
-MAX_OUTPUT_TOKENS = 1400
+MAX_OUTPUT_TOKENS = 1800
 
-st.title("🏠 VastuSense Demo")
-st.caption("Upload a floor plan and get Vastu suggestions.")
+client = OpenAI()  # uses OPENAI_API_KEY from env / Streamlit secrets
+
+# ---- Small UI styling for "commercial" feel ----
+st.markdown(
+    """
+    <style>
+      .vs-card { padding: 16px 18px; border-radius: 14px; border: 1px solid rgba(49,51,63,.15); background: white; }
+      .vs-subtle { color: rgba(49,51,63,.7); font-size: 0.95rem; }
+      .vs-pill { display:inline-block; padding:10px 12px; border-radius:14px; border: 1px solid rgba(49,51,63,.12); background: rgba(0,0,0,.02); }
+      .vs-hr { margin: 18px 0; }
+      .vs-tiles { display:flex; gap:12px; flex-wrap:wrap; }
+      .vs-tile { flex: 1 1 260px; padding: 14px 14px; border-radius: 14px; border: 1px solid rgba(49,51,63,.12); background: white; }
+      .vs-tile h4 { margin: 0 0 6px 0; font-size: 1.0rem; }
+      .vs-tile p { margin: 0; color: rgba(49,51,63,.8); }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown("## 🏠 VastuSense — Floor Plan Quick Review")
+st.markdown(
+    '<div class="vs-subtle">Upload a floor plan and get a polished Vastu report + scorecard (demo).</div>',
+    unsafe_allow_html=True
+)
 
 # Session state
 st.session_state.setdefault("out", "")
 st.session_state.setdefault("err", "")
+st.session_state.setdefault("usage", None)
 
-client = OpenAI()  # uses OPENAI_API_KEY from environment/secrets
+# ---- Layout ----
+left, right = st.columns([1, 1], gap="large")
 
-st.subheader("1) Upload floor plan")
-uploaded = st.file_uploader("Upload floor plan (PDF / PNG / JPG / WEBP)", type=["pdf", "png", "jpg", "jpeg", "webp"])
+with left:
+    st.markdown("### 1) Upload floor plan")
+    uploaded = st.file_uploader(
+        "Upload floor plan (PDF / PNG / JPG / WEBP)",
+        type=["pdf", "png", "jpg", "jpeg", "webp"]
+    )
 
-if uploaded:
-    name = uploaded.name.lower()
-    if name.endswith(".pdf"):
-        st.info(f"📄 Floor plan PDF uploaded: **{uploaded.name}**")
-    else:
-        st.image(uploaded, caption=uploaded.name, use_container_width=True)
+    if uploaded:
+        name = uploaded.name.lower()
+        if name.endswith(".pdf"):
+            st.info(f"📄 Floor plan PDF uploaded: **{uploaded.name}**")
+        else:
+            st.image(uploaded, caption=uploaded.name, use_container_width=True)
 
-st.subheader("2) Additional information")
-additional_info = st.text_area(
-    "Add any context (optional)",
-    placeholder="Example: Main entrance direction (if known), city, plot facing, apartment vs bungalow, any constraints/preferences...",
-    height=120
-)
+with right:
+    st.markdown("### 2) Additional information (optional)")
+    additional_info = st.text_area(
+        "Helps improve accuracy",
+        placeholder=(
+            "Examples:\n"
+            "• North direction (e.g., 'Top of plan is North')\n"
+            "• Main entrance location/direction\n"
+            "• Plot facing, city\n"
+            "• Constraints (cannot move kitchen, etc.)"
+        ),
+        height=160
+    )
 
-st.markdown("")
+    c1, c2 = st.columns([1, 1])
+    show = c1.button("✨ Show Vastu Suggestions", type="primary", use_container_width=True)
+    clear = c2.button("🧹 Clear", use_container_width=True)
 
-show = st.button("✨ Show Vastu Suggestions", type="primary", use_container_width=True)
+if clear:
+    st.session_state["out"] = ""
+    st.session_state["err"] = ""
+    st.session_state["usage"] = None
+
 
 def build_user_prompt(extra: str) -> str:
-    base = (
-        "You are a Vastu consultant. Analyze the uploaded floor plan and provide practical Vastu suggestions.\n\n"
-        "Output format:\n"
-        "1) Quick Summary (5 bullets)\n"
-        "2) Positives (bullets)\n"
-        "3) Issues / Risks (bullets)\n"
-        "4) Room-wise Suggestions (Kitchen, Bedrooms, Toilets, Living, Pooja, Entrance)\n"
-        "5) Easy Remedies (low-cost, non-structural first)\n"
-        "6) Questions to confirm (if anything is unclear)\n\n"
-        "Be clear, specific, and avoid superstition-heavy language. If directions are unclear, say so and give best-effort guidance."
-    )
+    # Commercial / report-style output request
+    base = """
+You are a professional Vastu consultant preparing a client-facing mini report for a commercial demo.
+
+Analyze the uploaded floor plan image/PDF and produce a polished, easy-to-read report.
+Be practical, confident, and specific. If North direction isn't visible, state assumptions clearly.
+
+Output in STRICT Markdown with this structure:
+
+# VastuSense Report
+## Snapshot
+- Assumed North:
+- Home type:
+- Key strengths:
+- Key risks:
+
+## Scorecard (0–10)
+- Entrance:
+- Kitchen:
+- Bedrooms:
+- Toilets/Baths:
+- Living/Dining:
+- Overall:
+
+## Top 5 Recommendations (Most Impact)
+1.
+2.
+3.
+4.
+5.
+
+## Room-wise Guidance
+### Entrance
+### Living / Dining
+### Kitchen
+### Bedrooms
+### Toilets / Baths
+### Outdoor / Water (patio/pool/terrace)
+
+## Quick Remedies (No structural changes)
+- ...
+
+## Questions to Confirm (to improve accuracy)
+- ...
+
+Formatting rules:
+- Use short bullets, bold keywords, and clear headings.
+- Avoid superstition-heavy tone; keep it consultative and modern.
+- If any room labels are unclear, say so and provide best-effort guidance.
+""".strip()
+
     if extra and extra.strip():
         base += f"\n\nAdditional user information:\n{extra.strip()}"
     return base
+
 
 def run_openai(uploaded_file, extra_info):
     filename = uploaded_file.name
@@ -62,7 +152,7 @@ def run_openai(uploaded_file, extra_info):
     mime = uploaded_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
     prompt_text = build_user_prompt(extra_info)
 
-    # PDF: upload to Files API, then reference via input_file
+    # PDF: upload then reference via input_file
     if filename.lower().endswith(".pdf"):
         f = io.BytesIO(file_bytes)
         f.name = filename
@@ -79,9 +169,9 @@ def run_openai(uploaded_file, extra_info):
                 ],
             }],
         )
-        return resp.output_text
+        return resp
 
-    # Image: base64 data URL
+    # Image: base64 data URL with LOW detail to reduce tokens/cost
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     data_url = f"data:{mime};base64,{b64}"
 
@@ -92,30 +182,72 @@ def run_openai(uploaded_file, extra_info):
             "role": "user",
             "content": [
                 {"type": "input_text", "text": prompt_text},
-                {"type": "input_image", "image_url": data_url},
+                {"type": "input_image", "image_url": data_url, "detail": "low"},  # ✅ LOW detail
             ],
         }],
     )
-    return resp.output_text
+    return resp
 
-if show:
-    st.session_state["err"] = ""
-    st.session_state["out"] = ""
 
-    if not uploaded:
-        st.session_state["err"] = "Please upload a floor plan (PDF or image)."
-    else:
-        with st.spinner("Analyzing floor plan..."):
-            try:
-                st.session_state["out"] = run_openai(uploaded, additional_info)
-            except Exception as e:
-                st.session_state["err"] = str(e)
+# ---------- Pretty UI helpers ----------
+def extract_scorecard(md: str) -> dict:
+    """
+    Extracts score lines like:
+    - Entrance: 7/10
+    - Overall: 8
+    Returns dict with keys -> float scores (0..10)
+    """
+    scores = {}
+    in_section = False
+    for line in md.splitlines():
+        if line.strip().startswith("## Scorecard"):
+            in_section = True
+            continue
+        if in_section and line.strip().startswith("## "):
+            break
+        if in_section:
+            m = re.match(r"^\s*-\s*([^:]+)\s*:\s*([0-9]+(\.[0-9]+)?)", line.strip())
+            if m:
+                key = m.group(1).strip()
+                val = float(m.group(2))
+                # clamp
+                val = max(0.0, min(10.0, val))
+                scores[key] = val
+    return scores
 
-st.markdown("---")
-st.subheader("Vastu Suggestions")
 
-if st.session_state["err"]:
-    st.error(st.session_state["err"])
+def extract_top_recos(md: str, n=3) -> list:
+    """
+    Finds '## Top 5 Recommendations' section and extracts first N numbered items.
+    """
+    recos = []
+    lines = md.splitlines()
+    in_section = False
+    for line in lines:
+        if line.strip().startswith("## Top 5 Recommendations"):
+            in_section = True
+            continue
+        if in_section and line.strip().startswith("## "):
+            break
+        if in_section:
+            m = re.match(r"^\s*\d+\.\s+(.*)", line.strip())
+            if m:
+                recos.append(m.group(1).strip())
+                if len(recos) >= n:
+                    break
+    return recos
 
-if st.session_state["out"]:
-    st.write(st.session_state["out"])
+
+def markdown_to_plain(md: str) -> str:
+    """
+    Light markdown -> text for PDF export.
+    Keeps headings and bullets readable.
+    """
+    text = md
+
+    # Convert headings to uppercase-ish
+    text = re.sub(r"^######\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^#####\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^####\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^###\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^##\s*", "\n*
