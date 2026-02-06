@@ -250,4 +250,161 @@ def markdown_to_plain(md: str) -> str:
     text = re.sub(r"^#####\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^####\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^###\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^##\s*", "\n*
+    text = re.sub(r"^##\s*", "\n", text, flags=re.MULTILINE)
+    text = re.sub(r"^#\s*", "\n", text, flags=re.MULTILINE)
+
+    # Remove bold markers
+    text = text.replace("**", "")
+
+    # Keep bullets readable
+    text = re.sub(r"^\s*-\s*", "• ", text, flags=re.MULTILINE)
+
+    return text.strip()
+
+
+def make_pdf_bytes(title: str, md_report: str) -> bytes:
+    """
+    Generates a simple one-file PDF with wrapped text.
+    """
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    margin = 0.7 * inch
+    y = height - margin
+
+    # Title
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(margin, y, title)
+    y -= 18
+
+    c.setFont("Helvetica", 10)
+
+    plain = markdown_to_plain(md_report)
+    lines = []
+    for para in plain.split("\n"):
+        if not para.strip():
+            lines.append("")
+            continue
+
+        # wrap per line
+        max_chars = 105  # rough wrap for A4 with 10pt font
+        while len(para) > max_chars:
+            cut = para.rfind(" ", 0, max_chars)
+            if cut == -1:
+                cut = max_chars
+            lines.append(para[:cut].rstrip())
+            para = para[cut:].lstrip()
+        lines.append(para)
+
+    for line in lines:
+        if y <= margin:
+            c.showPage()
+            c.setFont("Helvetica", 10)
+            y = height - margin
+
+        c.drawString(margin, y, line[:1400])  # safe guard
+        y -= 14
+
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------- Run ----------
+if show:
+    st.session_state["err"] = ""
+    st.session_state["out"] = ""
+    st.session_state["usage"] = None
+
+    if not uploaded:
+        st.session_state["err"] = "Please upload a floor plan (PDF or image)."
+    else:
+        with st.spinner("Analyzing floor plan..."):
+            try:
+                resp = run_openai(uploaded, additional_info)
+                st.session_state["out"] = resp.output_text
+                st.session_state["usage"] = getattr(resp, "usage", None)
+            except Exception as e:
+                msg = str(e)
+                if "insufficient_quota" in msg or "exceeded your current quota" in msg:
+                    st.session_state["err"] = (
+                        "OpenAI API quota/billing issue (429: insufficient_quota).\n\n"
+                        "Fix: OpenAI Platform → Billing → add payment method/credits, and check Usage/Limits."
+                    )
+                else:
+                    st.session_state["err"] = msg
+
+st.markdown('<hr class="vs-hr"/>', unsafe_allow_html=True)
+
+# ---------- OUTPUT AREA ----------
+st.markdown("### 📄 VastuSense Output")
+
+if st.session_state["err"]:
+    st.error(st.session_state["err"])
+
+if st.session_state["out"]:
+    report_md = st.session_state["out"]
+
+    # Parse scorecard + top recos
+    scores = extract_scorecard(report_md)
+    top3 = extract_top_recos(report_md, n=3)
+
+    # 1) SCORE GAUGE
+    st.markdown("#### 📊 Score Snapshot")
+    overall = scores.get("Overall")
+    if overall is not None:
+        st.progress(overall / 10.0)
+        st.caption(f"Overall Score: {overall:.1f} / 10")
+
+        # Optional metrics row
+        metric_cols = st.columns(5)
+        keys = ["Entrance", "Kitchen", "Bedrooms", "Toilets/Baths", "Living/Dining"]
+        for i, k in enumerate(keys):
+            val = scores.get(k)
+            metric_cols[i].metric(k, f"{val:.1f}/10" if val is not None else "—")
+    else:
+        st.info("Scorecard not detected in output (ask the model to keep the Scorecard section).")
+
+    # 2) TOP 3 HIGHLIGHTS TILES
+    st.markdown("#### ⭐ Top 3 Highlights")
+    if top3:
+        st.markdown('<div class="vs-tiles">', unsafe_allow_html=True)
+        for idx, rec in enumerate(top3, start=1):
+            st.markdown(
+                f"""
+                <div class="vs-tile">
+                  <h4>Recommendation #{idx}</h4>
+                  <p>{rec}</p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.info("Top recommendations not detected (ask the model to keep the 'Top 5 Recommendations' section).")
+
+    # Pretty report card
+    st.markdown("#### 🧾 Full Report")
+    st.markdown('<div class="vs-card">', unsafe_allow_html=True)
+    st.markdown(report_md)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # 3) DOWNLOAD AS PDF
+    st.markdown("#### ⬇️ Download")
+    pdf_bytes = make_pdf_bytes(
+        title="VastuSense Report",
+        md_report=report_md
+    )
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    st.download_button(
+        label="📄 Download Report as PDF",
+        data=pdf_bytes,
+        file_name=f"VastuSense_Report_{ts}.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
+
+    # (Optional) Show usage for debugging; comment out if you don't want it visible
+    # if st.session_state["usage"]:
+    #     st.caption(f"Usage: {st.session_state['usage']}")
