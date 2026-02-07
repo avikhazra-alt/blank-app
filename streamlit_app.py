@@ -26,7 +26,7 @@ MAX_FILE_MB = 50                      # HARD LIMIT per file
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
 # Loading GIF path (add this file to your repo)
-LOADING_GIF_PATH = "assets/vastu_loading.gif"
+LOADING_GIF_PATH = "vastu_loading_mandala.gif"
 
 client = OpenAI()  # uses OPENAI_API_KEY from env / Streamlit secrets
 
