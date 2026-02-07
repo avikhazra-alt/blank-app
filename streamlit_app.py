@@ -13,14 +13,15 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
 import cv2
+import pandas as pd
 
 st.set_page_config(page_title="VastuSense Demo", layout="wide")
 
 # ---- Fixed settings (hidden) ----
 MODEL = "gpt-4o-mini"
 MAX_OUTPUT_TOKENS = 2000
-VIDEO_MAX_FRAMES = 8  # keep low for cost/speed
-MAX_FILE_MB = 50
+VIDEO_MAX_FRAMES = 8                  # keep low for cost/speed
+MAX_FILE_MB = 50                      # HARD LIMIT per file
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
 client = OpenAI()  # uses OPENAI_API_KEY from env / Streamlit secrets
@@ -64,11 +65,28 @@ def validate_file_size(file_obj, label: str):
         return
     size = getattr(file_obj, "size", None)
     if size is None:
-        # fallback (rare)
         size = len(file_obj.getvalue())
     if size > MAX_FILE_BYTES:
         raise ValueError(f"{label} is {bytes_to_mb(size):.1f} MB. Maximum allowed is {MAX_FILE_MB} MB.")
 
+def parse_google_maps_link(url: str):
+    """
+    Extract lat/long from common Google Maps URL formats:
+      - .../@18.5204,73.8567,17z
+      - ...!3d18.5204!4d73.8567
+    """
+    if not url:
+        return None, None
+
+    m = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", url)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+
+    m = re.search(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", url)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+
+    return None, None
 
 def extract_video_frames_as_dataurls(video_bytes: bytes, max_frames: int = 8):
     data_urls = []
@@ -114,7 +132,9 @@ def build_user_prompt(additional_info: str,
                       north_on_plan: str,
                       entrance_dir: str,
                       home_type: str,
-                      advice_style: str) -> str:
+                      advice_style: str,
+                      lat: float | None,
+                      lon: float | None) -> str:
     base = f"""
 You are a professional Vastu consultant preparing a client-facing mini report for a commercial demo.
 
@@ -126,6 +146,19 @@ Use the following form inputs as ground truth if provided:
 - Main entrance direction: {entrance_dir}
 - Home type: {home_type}
 - Advice style: {advice_style}
+""".strip()
+
+    if lat is not None and lon is not None and not (lat == 0.0 and lon == 0.0):
+        base += f"""
+
+Property location (optional):
+- Latitude: {lat}
+- Longitude: {lon}
+
+Use location only to improve orientation context (true north vs magnetic) and solar/daylight considerations.
+""".strip()
+
+    base += """
 
 Output in STRICT Markdown with this structure (do not omit any section):
 
@@ -184,6 +217,7 @@ Output in STRICT Markdown with this structure (do not omit any section):
 
     if additional_info and additional_info.strip():
         base += f"\n\nAdditional user information:\n{additional_info.strip()}"
+
     return base
 
 
@@ -221,11 +255,6 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
 
 # ---------- Output parsing ----------
 def extract_readiness_score_1_100(md: str):
-    """
-    Looks for a line like:
-    - Score: 78
-    within '## Vastu Readiness Score (1–100)' section.
-    """
     in_section = False
     for line in md.splitlines():
         if line.strip().startswith("## Vastu Readiness Score"):
@@ -239,7 +268,6 @@ def extract_readiness_score_1_100(md: str):
                 v = int(m.group(1))
                 return max(1, min(100, v))
     return None
-
 
 def extract_scorecard(md: str) -> dict:
     scores = {}
@@ -257,7 +285,6 @@ def extract_scorecard(md: str) -> dict:
                 val = float(m.group(2))
                 scores[key] = max(0.0, min(10.0, val))
     return scores
-
 
 def extract_top_recos(md: str, n=3) -> list:
     recos = []
@@ -285,7 +312,6 @@ def markdown_to_plain(md: str) -> str:
     text = text.replace("**", "")
     text = re.sub(r"^\s*-\s*", "• ", text, flags=re.MULTILINE)
     return text.strip()
-
 
 def make_pdf_bytes(title: str, md_report: str) -> bytes:
     buf = io.BytesIO()
@@ -348,7 +374,6 @@ with left:
     st.markdown('<div class="small-note">Tip: Keep video short. We sample a few frames (cost-optimized).</div>',
                 unsafe_allow_html=True)
 
-    # show previews
     if uploaded:
         if uploaded.name.lower().endswith(".pdf"):
             st.info(f"📄 Floor plan PDF uploaded: **{uploaded.name}** ({bytes_to_mb(uploaded.size):.1f} MB)")
@@ -369,11 +394,29 @@ with right:
     home_type = cC.selectbox("Home type", ["Unknown", "Apartment", "Villa/Bungalow", "Row house"])
     advice_style = cD.selectbox("Advice style", ["Practical", "Strict"])
 
-    st.markdown("### 3) Additional information (optional)")
+    st.markdown("### 3) Property location (optional)")
+    loc_mode = st.radio("Choose input method", ["Paste Google Maps link", "Enter latitude/longitude"], horizontal=True)
+    lat = lon = None
+
+    if loc_mode == "Paste Google Maps link":
+        gmap_link = st.text_input("Google Maps link", placeholder="Paste Google Maps share link / URL here")
+        lat, lon = parse_google_maps_link(gmap_link)
+        if gmap_link and (lat is None or lon is None):
+            st.warning("Could not extract latitude/longitude from this link. Try copying the full Maps URL again.")
+    else:
+        cL1, cL2 = st.columns(2)
+        lat = cL1.number_input("Latitude", value=0.0, format="%.6f")
+        lon = cL2.number_input("Longitude", value=0.0, format="%.6f")
+
+    if lat is not None and lon is not None and not (lat == 0.0 and lon == 0.0):
+        st.success(f"📍 Location captured: {lat:.6f}, {lon:.6f}")
+        st.map(pd.DataFrame([{"lat": lat, "lon": lon}]))
+
+    st.markdown("### 4) Additional information (optional)")
     additional_info = st.text_area(
         "Helps improve accuracy",
         placeholder="Example: exact entrance location, constraints (cannot move kitchen), preferences (minimal changes)…",
-        height=140
+        height=120
     )
 
     include_video = st.toggle("Include video frames in analysis (optional)", value=True)
@@ -418,6 +461,7 @@ if show:
                     entrance_dir=entrance_dir,
                     home_type=home_type,
                     advice_style=advice_style,
+                    lat=lat, lon=lon
                 )
 
                 video_to_send = video if (include_video and video is not None) else None
@@ -447,14 +491,11 @@ if st.session_state["err"]:
 if st.session_state["out"]:
     report_md = st.session_state["out"]
 
-    # NEW: readiness score 1-100
     readiness = extract_readiness_score_1_100(report_md)
-
-    # existing extras
     scores_0_10 = extract_scorecard(report_md)
     top3 = extract_top_recos(report_md, n=3)
 
-    # 1) Vastu readiness score meter (1–100)
+    # Readiness score meter (1–100)
     st.markdown("#### ✅ Vastu Readiness Score (1–100)")
     if readiness is not None:
         st.progress(readiness / 100.0)
@@ -462,7 +503,7 @@ if st.session_state["out"]:
     else:
         st.info("Readiness score not detected. (Model should keep '## Vastu Readiness Score (1–100)' section.)")
 
-    # 2) Optional 0–10 score snapshot (kept)
+    # Optional 0–10 score snapshot
     st.markdown("#### 📊 Score Snapshot (0–10)")
     overall = scores_0_10.get("Overall")
     if overall is not None:
@@ -476,7 +517,7 @@ if st.session_state["out"]:
     else:
         st.caption("0–10 scorecard not detected (optional).")
 
-    # 3) Top 3 tiles
+    # Top 3 tiles
     st.markdown("#### ⭐ Top 3 Highlights")
     if top3:
         st.markdown('<div class="vs-tiles">', unsafe_allow_html=True)
@@ -494,17 +535,17 @@ if st.session_state["out"]:
     else:
         st.info("Top recommendations not detected. (Keep 'Top 5 Recommendations' in output.)")
 
-    # 4) Full report card
+    # Full report card
     st.markdown("#### 🧾 Full Report")
     st.markdown('<div class="vs-card">', unsafe_allow_html=True)
     st.markdown(report_md)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # 5) Copy-ready report
+    # Copy-ready report
     st.markdown("#### 📋 Copy-ready report")
     st.text_area("Copy/paste this into WhatsApp / Email", report_md, height=220)
 
-    # 6) Download PDF
+    # Download PDF
     st.markdown("#### ⬇️ Download")
     pdf_bytes = make_pdf_bytes("VastuSense Report", report_md)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
