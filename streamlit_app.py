@@ -8,25 +8,24 @@ from datetime import datetime
 import streamlit as st
 from openai import OpenAI
 
-# PDF generation
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
-# Video frame extraction
 import cv2
-
 
 st.set_page_config(page_title="VastuSense Demo", layout="wide")
 
 # ---- Fixed settings (hidden) ----
 MODEL = "gpt-4o-mini"
-MAX_OUTPUT_TOKENS = 1800
-VIDEO_MAX_FRAMES = 8  # keep this low for cost/speed
+MAX_OUTPUT_TOKENS = 2000
+VIDEO_MAX_FRAMES = 8  # keep low for cost/speed
+MAX_FILE_MB = 50
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
 client = OpenAI()  # uses OPENAI_API_KEY from env / Streamlit secrets
 
-# ---- Small UI styling for "commercial" feel ----
+# ---- UI styling ----
 st.markdown(
     """
     <style>
@@ -45,7 +44,7 @@ st.markdown(
 
 st.markdown("## 🏠 VastuSense — Floor Plan Quick Review")
 st.markdown(
-    '<div class="vs-subtle">Upload a floor plan (+ optional walkthrough video) and get a polished Vastu report.</div>',
+    f'<div class="vs-subtle">Upload a floor plan (+ optional walkthrough video). Max upload size: <b>{MAX_FILE_MB} MB</b> per file.</div>',
     unsafe_allow_html=True
 )
 
@@ -56,12 +55,22 @@ st.session_state.setdefault("usage", None)
 
 
 # ---------- Helpers ----------
+def bytes_to_mb(n: int) -> float:
+    return n / (1024 * 1024)
+
+def validate_file_size(file_obj, label: str):
+    """Hard-block if uploaded file exceeds 50 MB."""
+    if file_obj is None:
+        return
+    size = getattr(file_obj, "size", None)
+    if size is None:
+        # fallback (rare)
+        size = len(file_obj.getvalue())
+    if size > MAX_FILE_BYTES:
+        raise ValueError(f"{label} is {bytes_to_mb(size):.1f} MB. Maximum allowed is {MAX_FILE_MB} MB.")
+
+
 def extract_video_frames_as_dataurls(video_bytes: bytes, max_frames: int = 8):
-    """
-    Extracts up to max_frames frames uniformly across the video.
-    Returns list of base64 data URLs (jpeg).
-    Uses OpenCV; writes to temp file because cv2.VideoCapture needs a file path.
-    """
     data_urls = []
     if not video_bytes:
         return data_urls
@@ -79,7 +88,6 @@ def extract_video_frames_as_dataurls(video_bytes: bytes, max_frames: int = 8):
             cap.release()
             return data_urls
 
-        # Uniform sampling across the video timeline
         max_frames = max(1, int(max_frames))
         indices = [int(i * (total - 1) / max_frames) for i in range(max_frames)]
         indices = sorted(set(indices))
@@ -90,7 +98,6 @@ def extract_video_frames_as_dataurls(video_bytes: bytes, max_frames: int = 8):
             if not ok or frame is None:
                 continue
 
-            # Encode frame as JPEG
             ok2, buf = cv2.imencode(".jpg", frame)
             if not ok2:
                 continue
@@ -103,16 +110,36 @@ def extract_video_frames_as_dataurls(video_bytes: bytes, max_frames: int = 8):
     return data_urls
 
 
-def build_user_prompt(extra: str) -> str:
-    base = """
+def build_user_prompt(additional_info: str,
+                      north_on_plan: str,
+                      entrance_dir: str,
+                      home_type: str,
+                      advice_style: str) -> str:
+    base = f"""
 You are a professional Vastu consultant preparing a client-facing mini report for a commercial demo.
 
-Analyze the uploaded floor plan (and optional walkthrough frames if provided) and produce a polished, easy-to-read report.
-Be practical, confident, and specific. If North direction isn't visible, state assumptions clearly.
+Analyze the uploaded floor plan (and optional walkthrough frames if provided). Be practical and specific.
+Never guess silently. If something is not visible, say "Not determined from the plan" and ask a question.
 
-Output in STRICT Markdown with this structure:
+Use the following form inputs as ground truth if provided:
+- North on plan: {north_on_plan}
+- Main entrance direction: {entrance_dir}
+- Home type: {home_type}
+- Advice style: {advice_style}
+
+Output in STRICT Markdown with this structure (do not omit any section):
 
 # VastuSense Report
+
+## Vastu Readiness Score (1–100)
+- Score: <integer from 1 to 100>
+- What this score means (1 short paragraph)
+
+## Confidence & Assumptions
+- Confidence: High/Medium/Low
+- Assumptions:
+  - ...
+
 ## Snapshot
 - Assumed North:
 - Home type:
@@ -128,11 +155,11 @@ Output in STRICT Markdown with this structure:
 - Overall:
 
 ## Top 5 Recommendations (Most Impact)
-1.
-2.
-3.
-4.
-5.
+1. [Impact: High/Medium/Low | Effort: Low/Medium/High] ...
+2. [Impact: ... | Effort: ...] ...
+3. ...
+4. ...
+5. ...
 
 ## Room-wise Guidance
 ### Entrance
@@ -145,29 +172,28 @@ Output in STRICT Markdown with this structure:
 ## Quick Remedies (No structural changes)
 - ...
 
-## Questions to Confirm (to improve accuracy)
+## Action Plan
+### Next 7 days (easy fixes)
+- ...
+### Next 30 days (optional upgrades)
 - ...
 
-Formatting rules:
-- Use short bullets, bold keywords, and clear headings.
-- Avoid superstition-heavy tone; keep it consultative and modern.
-- If any room labels are unclear, say so and provide best-effort guidance.
+## Questions to Confirm (to improve accuracy)
+- ...
 """.strip()
 
-    if extra and extra.strip():
-        base += f"\n\nAdditional user information:\n{extra.strip()}"
+    if additional_info and additional_info.strip():
+        base += f"\n\nAdditional user information:\n{additional_info.strip()}"
     return base
 
 
-def run_openai(floorplan_file, extra_info: str, video_file=None):
+def run_openai(floorplan_file, prompt_text: str, video_file=None):
     filename = floorplan_file.name
     file_bytes = floorplan_file.getvalue()
     mime = floorplan_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    prompt_text = build_user_prompt(extra_info)
 
     content = [{"type": "input_text", "text": prompt_text}]
 
-    # Attach floor plan
     if filename.lower().endswith(".pdf"):
         f = io.BytesIO(file_bytes)
         f.name = filename
@@ -178,7 +204,6 @@ def run_openai(floorplan_file, extra_info: str, video_file=None):
         data_url = f"data:{mime};base64,{b64}"
         content.append({"type": "input_image", "image_url": data_url, "detail": "low"})  # ✅ LOW detail
 
-    # Optional video frames
     if video_file is not None:
         frames = extract_video_frames_as_dataurls(video_file.getvalue(), max_frames=VIDEO_MAX_FRAMES)
         if frames:
@@ -192,6 +217,28 @@ def run_openai(floorplan_file, extra_info: str, video_file=None):
         input=[{"role": "user", "content": content}],
     )
     return resp
+
+
+# ---------- Output parsing ----------
+def extract_readiness_score_1_100(md: str):
+    """
+    Looks for a line like:
+    - Score: 78
+    within '## Vastu Readiness Score (1–100)' section.
+    """
+    in_section = False
+    for line in md.splitlines():
+        if line.strip().startswith("## Vastu Readiness Score"):
+            in_section = True
+            continue
+        if in_section and line.strip().startswith("## "):
+            break
+        if in_section:
+            m = re.match(r"^\s*-\s*Score\s*:\s*([0-9]{1,3})\s*$", line.strip(), flags=re.IGNORECASE)
+            if m:
+                v = int(m.group(1))
+                return max(1, min(100, v))
+    return None
 
 
 def extract_scorecard(md: str) -> dict:
@@ -230,6 +277,7 @@ def extract_top_recos(md: str, n=3) -> list:
     return recos
 
 
+# ---------- PDF ----------
 def markdown_to_plain(md: str) -> str:
     text = md
     text = re.sub(r"^##\s*", "\n", text, flags=re.MULTILINE)
@@ -282,7 +330,7 @@ def make_pdf_bytes(title: str, md_report: str) -> bytes:
     return buf.read()
 
 
-# ---------- UI ----------
+# ================== UI ==================
 left, right = st.columns([1, 1], gap="large")
 
 with left:
@@ -297,33 +345,46 @@ with left:
         "Upload video (MP4 / MOV / M4V) — optional",
         type=["mp4", "mov", "m4v"]
     )
-    st.markdown('<div class="small-note">Tip: A short 10–30s walkthrough video is enough. The app samples a few frames.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-note">Tip: Keep video short. We sample a few frames (cost-optimized).</div>',
+                unsafe_allow_html=True)
 
+    # show previews
     if uploaded:
-        name = uploaded.name.lower()
-        if name.endswith(".pdf"):
-            st.info(f"📄 Floor plan PDF uploaded: **{uploaded.name}**")
+        if uploaded.name.lower().endswith(".pdf"):
+            st.info(f"📄 Floor plan PDF uploaded: **{uploaded.name}** ({bytes_to_mb(uploaded.size):.1f} MB)")
         else:
-            st.image(uploaded, caption=uploaded.name, use_container_width=True)
+            st.image(uploaded, caption=f"{uploaded.name} ({bytes_to_mb(uploaded.size):.1f} MB)",
+                     use_container_width=True)
 
     if video:
         st.video(video)
+        st.caption(f"🎥 Video size: {bytes_to_mb(video.size):.1f} MB")
 
 with right:
-    st.markdown("### 2) Additional information (optional)")
+    st.markdown("### 2) Quick inputs (recommended)")
+    cA, cB, cC, cD = st.columns(4)
+
+    north_on_plan = cA.selectbox("North on plan", ["Unknown", "Top", "Right", "Bottom", "Left"])
+    entrance_dir = cB.selectbox("Main entrance", ["Unknown", "North", "East", "South", "West", "NE", "NW", "SE", "SW"])
+    home_type = cC.selectbox("Home type", ["Unknown", "Apartment", "Villa/Bungalow", "Row house"])
+    advice_style = cD.selectbox("Advice style", ["Practical", "Strict"])
+
+    st.markdown("### 3) Additional information (optional)")
     additional_info = st.text_area(
         "Helps improve accuracy",
-        placeholder=(
-            "Examples:\n"
-            "• North direction (e.g., 'Top of plan is North')\n"
-            "• Main entrance location/direction\n"
-            "• Plot facing, city\n"
-            "• Constraints (cannot move kitchen, etc.)"
-        ),
-        height=160
+        placeholder="Example: exact entrance location, constraints (cannot move kitchen), preferences (minimal changes)…",
+        height=140
     )
 
     include_video = st.toggle("Include video frames in analysis (optional)", value=True)
+
+    if uploaded:
+        st.info(
+            f"✅ Floor plan: {uploaded.name}\n"
+            f"✅ Video: {'Included' if (video and include_video) else 'Not included'}\n"
+            f"⚙️ Vision detail: LOW (cost-optimized)\n"
+            f"📦 Upload limit: {MAX_FILE_MB} MB per file"
+        )
 
     c1, c2 = st.columns([1, 1])
     show = c1.button("✨ Show Vastu Suggestions", type="primary", use_container_width=True)
@@ -341,24 +402,39 @@ if show:
     st.session_state["out"] = ""
     st.session_state["usage"] = None
 
-    if not uploaded:
-        st.session_state["err"] = "Please upload a floor plan (PDF or image)."
-    else:
-        with st.spinner("Analyzing floor plan..."):
-            try:
+    try:
+        if not uploaded:
+            st.session_state["err"] = "Please upload a floor plan (PDF or image)."
+        else:
+            # HARD LIMITS
+            validate_file_size(uploaded, "Floor plan file")
+            if include_video and video is not None:
+                validate_file_size(video, "Video file")
+
+            with st.spinner("Analyzing floor plan..."):
+                prompt_text = build_user_prompt(
+                    additional_info=additional_info,
+                    north_on_plan=north_on_plan,
+                    entrance_dir=entrance_dir,
+                    home_type=home_type,
+                    advice_style=advice_style,
+                )
+
                 video_to_send = video if (include_video and video is not None) else None
-                resp = run_openai(uploaded, additional_info, video_file=video_to_send)
+                resp = run_openai(uploaded, prompt_text, video_file=video_to_send)
+
                 st.session_state["out"] = resp.output_text
                 st.session_state["usage"] = getattr(resp, "usage", None)
-            except Exception as e:
-                msg = str(e)
-                if "insufficient_quota" in msg or "exceeded your current quota" in msg:
-                    st.session_state["err"] = (
-                        "OpenAI API quota/billing issue (429: insufficient_quota).\n\n"
-                        "Fix: OpenAI Platform → Billing → add payment method/credits, and check Usage/Limits."
-                    )
-                else:
-                    st.session_state["err"] = msg
+
+    except Exception as e:
+        msg = str(e)
+        if "insufficient_quota" in msg or "exceeded your current quota" in msg:
+            st.session_state["err"] = (
+                "OpenAI API quota/billing issue (429: insufficient_quota).\n\n"
+                "Fix: OpenAI Platform → Billing → add payment method/credits, and check Usage/Limits."
+            )
+        else:
+            st.session_state["err"] = msg
 
 
 # ---------- Output ----------
@@ -370,25 +446,37 @@ if st.session_state["err"]:
 
 if st.session_state["out"]:
     report_md = st.session_state["out"]
-    scores = extract_scorecard(report_md)
+
+    # NEW: readiness score 1-100
+    readiness = extract_readiness_score_1_100(report_md)
+
+    # existing extras
+    scores_0_10 = extract_scorecard(report_md)
     top3 = extract_top_recos(report_md, n=3)
 
-    # 1) Score gauge
-    st.markdown("#### 📊 Score Snapshot")
-    overall = scores.get("Overall")
+    # 1) Vastu readiness score meter (1–100)
+    st.markdown("#### ✅ Vastu Readiness Score (1–100)")
+    if readiness is not None:
+        st.progress(readiness / 100.0)
+        st.metric("Readiness Score", f"{readiness}/100")
+    else:
+        st.info("Readiness score not detected. (Model should keep '## Vastu Readiness Score (1–100)' section.)")
+
+    # 2) Optional 0–10 score snapshot (kept)
+    st.markdown("#### 📊 Score Snapshot (0–10)")
+    overall = scores_0_10.get("Overall")
     if overall is not None:
         st.progress(overall / 10.0)
-        st.caption(f"Overall Score: {overall:.1f} / 10")
-
+        st.caption(f"Overall (0–10): {overall:.1f} / 10")
         metric_cols = st.columns(5)
         keys = ["Entrance", "Kitchen", "Bedrooms", "Toilets/Baths", "Living/Dining"]
         for i, k in enumerate(keys):
-            val = scores.get(k)
+            val = scores_0_10.get(k)
             metric_cols[i].metric(k, f"{val:.1f}/10" if val is not None else "—")
     else:
-        st.info("Scorecard not detected in output (the model should keep the Scorecard section).")
+        st.caption("0–10 scorecard not detected (optional).")
 
-    # 2) Top 3 highlights tiles
+    # 3) Top 3 tiles
     st.markdown("#### ⭐ Top 3 Highlights")
     if top3:
         st.markdown('<div class="vs-tiles">', unsafe_allow_html=True)
@@ -404,15 +492,19 @@ if st.session_state["out"]:
             )
         st.markdown("</div>", unsafe_allow_html=True)
     else:
-        st.info("Top recommendations not detected (the model should keep 'Top 5 Recommendations').")
+        st.info("Top recommendations not detected. (Keep 'Top 5 Recommendations' in output.)")
 
-    # Pretty report card
+    # 4) Full report card
     st.markdown("#### 🧾 Full Report")
     st.markdown('<div class="vs-card">', unsafe_allow_html=True)
     st.markdown(report_md)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # 3) Download as PDF
+    # 5) Copy-ready report
+    st.markdown("#### 📋 Copy-ready report")
+    st.text_area("Copy/paste this into WhatsApp / Email", report_md, height=220)
+
+    # 6) Download PDF
     st.markdown("#### ⬇️ Download")
     pdf_bytes = make_pdf_bytes("VastuSense Report", report_md)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
@@ -423,7 +515,3 @@ if st.session_state["out"]:
         mime="application/pdf",
         use_container_width=True
     )
-
-    # Optional debugging
-    # if st.session_state["usage"]:
-    #     st.caption(f"Usage: {st.session_state['usage']}")
