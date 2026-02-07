@@ -2,3 +2,4 @@ streamlit
 openai
 reportlab
 opencv-python-headless
+pandas
