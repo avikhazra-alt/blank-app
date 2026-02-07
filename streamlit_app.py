@@ -19,14 +19,14 @@ import pandas as pd
 st.set_page_config(page_title="VastuSense Demo", layout="wide")
 
 # ---- Fixed settings (hidden) ----
-MODEL = "gpt-4o"
+MODEL = "gpt-4o-mini"
 MAX_OUTPUT_TOKENS = 2000
 VIDEO_MAX_FRAMES = 8                  # keep low for cost/speed
 MAX_FILE_MB = 50                      # HARD LIMIT per file
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
 # Loading GIF path (add this file to your repo)
-LOADING_GIF_PATH = "vastu_loading_mandala.gif"
+LOADING_GIF_PATH = "assets/vastu_loading.gif"
 
 client = OpenAI()  # uses OPENAI_API_KEY from env / Streamlit secrets
 
@@ -42,7 +42,21 @@ st.markdown(
       .vs-tile h4 { margin: 0 0 6px 0; font-size: 1.0rem; }
       .vs-tile p { margin: 0; color: rgba(49,51,63,.8); }
       .small-note { font-size: 0.9rem; color: rgba(49,51,63,.65); }
-      .center { display:flex; justify-content:center; }
+      .loading-panel {
+        border: 1px solid rgba(49,51,63,.15);
+        border-radius: 14px;
+        background: white;
+        padding: 12px 14px;
+      }
+      .loading-title {
+        font-weight: 700;
+        margin: 0 0 6px 0;
+      }
+      .loading-sub {
+        color: rgba(49,51,63,.7);
+        font-size: 0.92rem;
+        margin: 0 0 8px 0;
+      }
     </style>
     """,
     unsafe_allow_html=True
@@ -323,10 +337,9 @@ def markdown_to_plain(md: str) -> str:
 def make_pdf_bytes(title: str, md_report: str) -> bytes:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
 
     margin = 0.7 * inch
-    y = height - margin
+    y = A4[1] - margin
 
     c.setFont("Helvetica-Bold", 14)
     c.drawString(margin, y, title)
@@ -354,7 +367,7 @@ def make_pdf_bytes(title: str, md_report: str) -> bytes:
         if y <= margin:
             c.showPage()
             c.setFont("Helvetica", 10)
-            y = height - margin
+            y = A4[1] - margin
         c.drawString(margin, y, line[:1400])
         y -= 14
 
@@ -393,6 +406,9 @@ with left:
         st.caption(f"🎥 Video size: {bytes_to_mb(video.size):.1f} MB")
 
 with right:
+    # Placeholder panel for loading GIF (Option 2: right panel small card)
+    loading_panel = st.empty()
+
     st.markdown("### 2) Quick inputs (recommended)")
     cA, cB, cC, cD = st.columns(4)
 
@@ -471,12 +487,18 @@ if show:
 
             video_to_send = video if (include_video and video is not None) else None
 
-            # Show Vastu-friendly loading GIF while generating
-            loading_ph = st.empty()
+            # Option 2: show GIF in a small right-panel card
             try:
-                loading_ph.image(LOADING_GIF_PATH, use_container_width=True)
+                loading_panel.markdown(
+                    "<div class='loading-panel'>"
+                    "<div class='loading-title'>Generating report…</div>"
+                    "<div class='loading-sub'>Analyzing your floor plan and inputs</div>"
+                    "</div>",
+                    unsafe_allow_html=True
+                )
+                loading_panel.image(LOADING_GIF_PATH, width=160)
             except Exception:
-                loading_ph.info("Analyzing floor plan…")
+                loading_panel.info("Generating report…")
 
             with st.spinner("Generating report..."):
                 try:
@@ -484,9 +506,10 @@ if show:
                     st.session_state["out"] = resp.output_text
                     st.session_state["usage"] = getattr(resp, "usage", None)
                 finally:
-                    loading_ph.empty()
+                    loading_panel.empty()
 
     except Exception as e:
+        loading_panel.empty()
         msg = str(e)
         if "insufficient_quota" in msg or "exceeded your current quota" in msg:
             st.session_state["err"] = (
