@@ -19,7 +19,7 @@ import pandas as pd
 st.set_page_config(page_title="VastuSense Demo", layout="wide")
 
 # ---- Fixed settings (hidden) ----
-MODEL = "gpt-4o-mini"
+MODEL = "gpt-4o"
 MAX_OUTPUT_TOKENS = 2000
 VIDEO_MAX_FRAMES = 8                  # keep low for cost/speed
 MAX_FILE_MB = 50                      # HARD LIMIT per file
