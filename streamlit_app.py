@@ -15,14 +15,18 @@ from reportlab.lib.units import inch
 import cv2
 import pandas as pd
 
+
 st.set_page_config(page_title="VastuSense Demo", layout="wide")
 
 # ---- Fixed settings (hidden) ----
-MODEL = "gpt-4o-mini"
+MODEL = "gpt-4o"
 MAX_OUTPUT_TOKENS = 2000
 VIDEO_MAX_FRAMES = 8                  # keep low for cost/speed
 MAX_FILE_MB = 50                      # HARD LIMIT per file
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+
+# Loading GIF path (add this file to your repo)
+LOADING_GIF_PATH = "vastu_loading.gif"
 
 client = OpenAI()  # uses OPENAI_API_KEY from env / Streamlit secrets
 
@@ -38,6 +42,7 @@ st.markdown(
       .vs-tile h4 { margin: 0 0 6px 0; font-size: 1.0rem; }
       .vs-tile p { margin: 0; color: rgba(49,51,63,.8); }
       .small-note { font-size: 0.9rem; color: rgba(49,51,63,.65); }
+      .center { display:flex; justify-content:center; }
     </style>
     """,
     unsafe_allow_html=True
@@ -228,6 +233,7 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
 
     content = [{"type": "input_text", "text": prompt_text}]
 
+    # Floor plan
     if filename.lower().endswith(".pdf"):
         f = io.BytesIO(file_bytes)
         f.name = filename
@@ -238,6 +244,7 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
         data_url = f"data:{mime};base64,{b64}"
         content.append({"type": "input_image", "image_url": data_url, "detail": "low"})  # ✅ LOW detail
 
+    # Optional video frames
     if video_file is not None:
         frames = extract_video_frames_as_dataurls(video_file.getvalue(), max_frames=VIDEO_MAX_FRAMES)
         if frames:
@@ -449,26 +456,35 @@ if show:
         if not uploaded:
             st.session_state["err"] = "Please upload a floor plan (PDF or image)."
         else:
-            # HARD LIMITS
             validate_file_size(uploaded, "Floor plan file")
             if include_video and video is not None:
                 validate_file_size(video, "Video file")
 
-            with st.spinner("Analyzing floor plan..."):
-                prompt_text = build_user_prompt(
-                    additional_info=additional_info,
-                    north_on_plan=north_on_plan,
-                    entrance_dir=entrance_dir,
-                    home_type=home_type,
-                    advice_style=advice_style,
-                    lat=lat, lon=lon
-                )
+            prompt_text = build_user_prompt(
+                additional_info=additional_info,
+                north_on_plan=north_on_plan,
+                entrance_dir=entrance_dir,
+                home_type=home_type,
+                advice_style=advice_style,
+                lat=lat, lon=lon
+            )
 
-                video_to_send = video if (include_video and video is not None) else None
-                resp = run_openai(uploaded, prompt_text, video_file=video_to_send)
+            video_to_send = video if (include_video and video is not None) else None
 
-                st.session_state["out"] = resp.output_text
-                st.session_state["usage"] = getattr(resp, "usage", None)
+            # Show Vastu-friendly loading GIF while generating
+            loading_ph = st.empty()
+            try:
+                loading_ph.image(LOADING_GIF_PATH, use_container_width=True)
+            except Exception:
+                loading_ph.info("Analyzing floor plan…")
+
+            with st.spinner("Generating report..."):
+                try:
+                    resp = run_openai(uploaded, prompt_text, video_file=video_to_send)
+                    st.session_state["out"] = resp.output_text
+                    st.session_state["usage"] = getattr(resp, "usage", None)
+                finally:
+                    loading_ph.empty()
 
     except Exception as e:
         msg = str(e)
@@ -535,7 +551,7 @@ if st.session_state["out"]:
     else:
         st.info("Top recommendations not detected. (Keep 'Top 5 Recommendations' in output.)")
 
-    # Full report card
+    # Full report
     st.markdown("#### 🧾 Full Report")
     st.markdown('<div class="vs-card">', unsafe_allow_html=True)
     st.markdown(report_md)
