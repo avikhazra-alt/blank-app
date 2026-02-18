@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 # =========================
 st.set_page_config(page_title="VastuSense Demo", layout="wide")
 
-MODEL = "gpt-4o"
+MODEL = "gpt-5.2-pro"
 MAX_OUTPUT_TOKENS = 3200
 VIDEO_MAX_FRAMES = 8
 
@@ -390,6 +390,7 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
 
     content = [{"type": "input_text", "text": prompt_text}]
 
+    # ---------- Image or PDF ----------
     if filename.lower().endswith(".pdf"):
         f = io.BytesIO(file_bytes)
         f.name = filename
@@ -398,21 +399,74 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
     else:
         b64 = base64.b64encode(file_bytes).decode("utf-8")
         data_url = f"data:{mime};base64,{b64}"
-        content.append({"type": "input_image", "image_url": data_url, "detail": "low"})
+        content.append({
+            "type": "input_image",
+            "image_url": data_url,
+            "detail": "auto"     # quality > cost
+        })
 
+    # ---------- Video frames ----------
     if video_file is not None:
-        frames = extract_video_frames_as_dataurls(video_file.getvalue(), max_frames=VIDEO_MAX_FRAMES)
+        frames = extract_video_frames_as_dataurls(
+            video_file.getvalue(),
+            max_frames=VIDEO_MAX_FRAMES
+        )
         if frames:
-            content.append({"type": "input_text", "text": "Optional walkthrough video frames (additional context):"})
+            content.append({"type": "input_text", "text": "Additional walkthrough frames:"})
             for f_url in frames:
-                content.append({"type": "input_image", "image_url": f_url, "detail": "low"})
+                content.append({
+                    "type": "input_image",
+                    "image_url": f_url,
+                    "detail": "auto"
+                })
+
+    # ---------- Strict schema output ----------
+    response_schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "vastu_report",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "report_markdown": {"type": "string"},
+                    "scores": {
+                        "type": "object",
+                        "properties": {
+                            "rating": {"type": "number"},
+                            "readiness": {"type": "integer"}
+                        },
+                        "required": ["rating", "readiness"]
+                    },
+                    "confidence": {
+                        "type": "object",
+                        "properties": {
+                            "level": {"type": "string"},
+                            "score": {"type": "integer"}
+                        },
+                        "required": ["level", "score"]
+                    },
+                    "direction_scores": {
+                        "type": "object",
+                        "additionalProperties": {"type": "integer"}
+                    }
+                },
+                "required": ["report_markdown","scores","confidence","direction_scores"]
+            }
+        }
+    }
 
     resp = client.responses.create(
         model=MODEL,
+        reasoning={"effort": "high"},   # key for strict logic
+        temperature=0,                  # deterministic formatting
         max_output_tokens=MAX_OUTPUT_TOKENS,
+        response_format=response_schema,
         input=[{"role": "user", "content": content}],
     )
+
     return resp
+
 
 
 # =========================
