@@ -3,3 +3,6 @@ openai
 reportlab
 opencv-python-headless
 pandas
+pillow
+numpy
+matplotlib
