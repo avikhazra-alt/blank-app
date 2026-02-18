@@ -421,52 +421,53 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
                 })
 
     # ---------- Strict schema output ----------
-response_schema = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "vastu_report",
-        "strict": True,   # 👈 ADD HERE
-        "schema": {
-            "type": "object",
-            "properties": {
-                "report_markdown": {"type": "string"},
-                "scores": {
-                    "type": "object",
-                    "properties": {
-                        "rating": {"type": "number"},
-                        "readiness": {"type": "integer"}
+    # ---------- Strict schema output ----------
+    response_schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "vastu_report",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "report_markdown": {"type": "string"},
+                    "scores": {
+                        "type": "object",
+                        "properties": {
+                            "rating": {"type": "number"},
+                            "readiness": {"type": "integer"}
+                        },
+                        "required": ["rating", "readiness"]
                     },
-                    "required": ["rating", "readiness"]
-                },
-                "confidence": {
-                    "type": "object",
-                    "properties": {
-                        "level": {"type": "string"},
-                        "score": {"type": "integer"}
+                    "confidence": {
+                        "type": "object",
+                        "properties": {
+                            "level": {"type": "string"},
+                            "score": {"type": "integer"}
+                        },
+                        "required": ["level", "score"]
                     },
-                    "required": ["level", "score"]
+                    "direction_scores": {
+                        "type": "object",
+                        "additionalProperties": {"type": "integer"}
+                    }
                 },
-                "direction_scores": {
-                    "type": "object",
-                    "additionalProperties": {"type": "integer"}
-                }
-            },
-            "required": ["report_markdown","scores","confidence","direction_scores"]
+                "required": ["report_markdown","scores","confidence","direction_scores"]
+            }
         }
     }
-}
-
 
     resp = client.responses.create(
         model=MODEL,
-        reasoning={"effort": "high"},   # key for strict logic
-        temperature=0,                  # deterministic formatting
+        reasoning={"effort": "high"},
+        temperature=0,
         max_output_tokens=MAX_OUTPUT_TOKENS,
         response_format=response_schema,
         input=[{"role": "user", "content": content}],
     )
 
     return resp
+
 
 
 
