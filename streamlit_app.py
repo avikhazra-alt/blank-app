@@ -27,7 +27,7 @@ VIDEO_MAX_FRAMES = 8
 MAX_FILE_MB = 50
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
-LOADING_GIF_PATH = "assets/vastu_loading.gif"
+LOADING_GIF_PATH = "vastu_loading_mandala.gif"
 
 client = OpenAI()  # OPENAI_API_KEY must be set
 
