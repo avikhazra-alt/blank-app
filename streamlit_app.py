@@ -388,6 +388,10 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
     file_bytes = floorplan_file.getvalue()
     mime = floorplan_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
+    # NOTE:
+    # This app relies on machine-readable JSON lines appended to the END of the model's text
+    # (SCORES_JSON / CONFIDENCE_JSON / DIRECTION_SCORES_JSON) as instructed in build_user_prompt().
+    # Do NOT use 'response_format' here because older OpenAI SDKs don't support it on Responses API.
     content = [{"type": "input_text", "text": prompt_text}]
 
     # ---------- Image or PDF ----------
@@ -402,7 +406,7 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
         content.append({
             "type": "input_image",
             "image_url": data_url,
-            "detail": "auto"     # quality > cost
+            "detail": "auto"  # quality > cost
         })
 
     # ---------- Video frames ----------
@@ -420,57 +424,16 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
                     "detail": "auto"
                 })
 
-    # ---------- Strict schema output ----------
-    # ---------- Strict schema output ----------
-    response_schema = {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "vastu_report",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "report_markdown": {"type": "string"},
-                    "scores": {
-                        "type": "object",
-                        "properties": {
-                            "rating": {"type": "number"},
-                            "readiness": {"type": "integer"}
-                        },
-                        "required": ["rating", "readiness"]
-                    },
-                    "confidence": {
-                        "type": "object",
-                        "properties": {
-                            "level": {"type": "string"},
-                            "score": {"type": "integer"}
-                        },
-                        "required": ["level", "score"]
-                    },
-                    "direction_scores": {
-                        "type": "object",
-                        "additionalProperties": {"type": "integer"}
-                    }
-                },
-                "required": ["report_markdown","scores","confidence","direction_scores"]
-            }
-        }
-    }
-
+    # ---------- Model call ----------
     resp = client.responses.create(
         model=MODEL,
         reasoning={"effort": "high"},
         temperature=0,
         max_output_tokens=MAX_OUTPUT_TOKENS,
-        response_format=response_schema,
         input=[{"role": "user", "content": content}],
     )
 
     return resp
-
-
-
-
 # =========================
 # Premium Score UI (1: circular gauge, 4: confidence meter)
 # =========================
