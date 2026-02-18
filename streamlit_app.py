@@ -1,5 +1,6 @@
 import io
 import re
+import json
 import base64
 import mimetypes
 import tempfile
@@ -8,12 +9,19 @@ from datetime import datetime
 import streamlit as st
 from openai import OpenAI
 
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import inch
-
 import cv2
 import pandas as pd
+
+from PIL import Image, ImageDraw
+
+# PDF (high quality)
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+
+import numpy as np
+import matplotlib.pyplot as plt
 
 
 # =========================
@@ -22,14 +30,15 @@ import pandas as pd
 st.set_page_config(page_title="VastuSense Demo", layout="wide")
 
 MODEL = "gpt-4o"
-MAX_OUTPUT_TOKENS = 2800
+MAX_OUTPUT_TOKENS = 3200
 VIDEO_MAX_FRAMES = 8
+
 MAX_FILE_MB = 50
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
-LOADING_GIF_PATH = "vastu_loading_mandala.gif"
+LOADING_GIF_PATH = "assets/vastu_loading.gif"
 
-client = OpenAI()  # OPENAI_API_KEY must be set
+client = OpenAI()  # OPENAI_API_KEY must be set via env or Streamlit secrets
 
 
 # =========================
@@ -51,13 +60,6 @@ st.markdown(
       }
       .loading-title { font-weight: 700; margin: 0 0 6px 0; }
       .loading-sub { color: rgba(49,51,63,.7); font-size: 0.92rem; margin: 0 0 8px 0; }
-
-      .report-pre {
-        white-space: pre-wrap;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        line-height: 1.35;
-        font-size: 0.95rem;
-      }
     </style>
     """,
     unsafe_allow_html=True
@@ -69,8 +71,10 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# Session state
 st.session_state.setdefault("out", "")
 st.session_state.setdefault("err", "")
+st.session_state.setdefault("meta", {})  # parsed JSON blocks
 
 
 # =========================
@@ -138,60 +142,55 @@ def extract_video_frames_as_dataurls(video_bytes: bytes, max_frames: int = 8):
 
     return data_urls
 
+
 def sanitize_report_text(text: str) -> str:
-    """
-    Removes code fences like:
-    ```plaintext
-    ...
-    ```
-    and trims junk.
-    """
+    """Remove any accidental code fences like ```plaintext and trailing ```."""
     if not text:
         return ""
-
     t = text.strip()
-
-    # Remove starting fence ``` or ```plaintext / ```markdown etc.
     t = re.sub(r"^\s*```[a-zA-Z]*\s*\n", "", t)
-
-    # Remove ending fence ```
     t = re.sub(r"\n\s*```\s*$", "", t)
-
-    # Remove any stray standalone "plaintext" lines
     t = re.sub(r"^\s*plaintext\s*$", "", t, flags=re.MULTILINE)
-
     return t.strip()
 
-def extract_overall_rating_0_10(report: str):
-    # matches: Overall Rating: 8 / 10
-    m = re.search(r"Overall\s+Rating\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*10", report, flags=re.IGNORECASE)
-    if not m:
-        return None
-    v = float(m.group(1))
-    return max(0.0, min(10.0, v))
 
-def extract_readiness_1_100(report: str):
-    # matches: Vastu Readiness Score (1–100): 78  OR (1-100)
-    m = re.search(r"Vastu\s+Readiness\s+Score\s*\(1[–-]100\)\s*:\s*([0-9]{1,3})", report, flags=re.IGNORECASE)
+def extract_json_block(tag: str, text: str):
+    """
+    Extracts JSON emitted as:
+    TAG_JSON: {...}
+    Returns dict or None.
+    """
+    if not text:
+        return None
+    m = re.search(rf"{re.escape(tag)}_JSON:\s*(\{{.*?\}})\s*$", text, flags=re.DOTALL | re.MULTILINE)
     if not m:
         return None
-    v = int(m.group(1))
-    return max(1, min(100, v))
+    raw = m.group(1).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def strip_json_blocks(text: str):
+    """Remove trailing *_JSON blocks from report before displaying."""
+    if not text:
+        return ""
+    # remove any final lines like TAG_JSON: {...}
+    return re.sub(r"(?m)^[A-Z_]+_JSON:\s*\{.*\}\s*$", "", text).strip()
 
 
 # =========================
-# Prompt Builder (PDF-like + tables)
+# Resident context
 # =========================
-DIRECTION_ELEMENT_CONTROLS = [
-    ("North-East", "Water", "Health, clarity, spirituality"),
-    ("East", "Air", "Growth, social life"),
-    ("South-East", "Fire", "Kitchen, energy, metabolism"),
-    ("South", "Fire/Earth", "Fame, strength"),
-    ("South-West", "Earth", "Stability, relationships, finance"),
-    ("West", "Water", "Gains, opportunities"),
-    ("North-West", "Air", "Movement, networking"),
-    ("North", "Water", "Career, flow of money"),
-]
+GOAL_EXPLANATIONS = {
+    "Health": "ventilation, dampness control, daylight, kitchen/toilet hygiene",
+    "Sleep": "bed placement, mirror control, clutter reduction, calm lighting",
+    "Career/Focus": "work/study desk placement, stable back support, distraction control",
+    "Relationships": "stable seating, bedroom harmony, balanced zones",
+    "Finance": "leakage control, SW stability, north flow, tidy storage",
+    "Peace of mind": "NE lightness, open circulation, declutter, calm lighting",
+}
 
 def build_resident_context(primary: dict, others: list[dict]) -> str:
     lines = []
@@ -213,7 +212,30 @@ def build_resident_context(primary: dict, others: list[dict]) -> str:
     else:
         lines.append("\nAdditional Permanent Residents: None")
 
+    goals = primary.get("goals", [])
+    if goals:
+        lines.append("\nGoal Interpretation (prioritization guidance):")
+        for g in goals:
+            expl = GOAL_EXPLANATIONS.get(g)
+            if expl:
+                lines.append(f"- {g}: focus on {expl}")
+
     return "\n".join(lines)
+
+
+# =========================
+# Prompt Builder (Markdown tables + JSON outputs)
+# =========================
+DIRECTION_ELEMENT_CONTROLS = [
+    ("North-East", "Water", "Health, clarity, spirituality"),
+    ("East", "Air", "Growth, social life"),
+    ("South-East", "Fire", "Kitchen, energy, metabolism"),
+    ("South", "Fire/Earth", "Fame, strength"),
+    ("South-West", "Earth", "Stability, relationships, finance"),
+    ("West", "Water", "Gains, opportunities"),
+    ("North-West", "Air", "Movement, networking"),
+    ("North", "Water", "Career, flow of money"),
+]
 
 def build_user_prompt(
     *,
@@ -231,15 +253,14 @@ def build_user_prompt(
     primary_resident: dict,
     other_residents: list[dict],
 ) -> str:
-    # Build markdown table for direction controls
     dir_table = ["| Direction | Element | Controls |", "|---|---|---|"]
     for d, e, c in DIRECTION_ELEMENT_CONTROLS:
         dir_table.append(f"| {d} | {e} | {c} |")
     dir_table_md = "\n".join(dir_table)
 
-    loc_block = ""
+    loc_line = ""
     if lat is not None and lon is not None and not (lat == 0.0 and lon == 0.0):
-        loc_block = f"- Location: {lat}, {lon} (optional)"
+        loc_line = f"- Location: {lat}, {lon} (optional)"
 
     resident_block = build_resident_context(primary_resident, other_residents)
 
@@ -249,7 +270,7 @@ You are a professional Vastu consultant writing a client-facing report.
 STRICT RULES:
 - Vastu-only analysis. Do NOT do astrology/birth charts.
 - Output MUST be clean Markdown WITHOUT any code fences (no ```plaintext, no ```).
-- Follow the exact structure below. Keep alignment neat.
+- Match the report alignment of a professional consultant: neat headings, clean bullets, and tables.
 
 GROUND TRUTH INPUTS:
 - Property Type: {property_type}
@@ -259,7 +280,7 @@ GROUND TRUTH INPUTS:
 - Entrance Direction: {entrance_direction} ({entrance_movement})
 - House Alignment: {house_alignment}
 - Advice Style: {advice_style}
-{loc_block}
+{loc_line}
 
 RESIDENT PROFILE (use ONLY to prioritize recommendations / room allocation):
 {resident_block}
@@ -290,7 +311,8 @@ OUTPUT FORMAT (STRICT MARKDOWN):
 
 **Overall Vastu Balance:** <1–2 lines>  
 **Overall Rating:** <X / 10>  
-**Vastu Readiness Score (1–100):** <integer 1..100>
+**Vastu Readiness Score (1–100):** <integer 1..100>  
+**Confidence:** <High/Medium/Low>
 
 ---
 
@@ -341,6 +363,18 @@ OUTPUT FORMAT (STRICT MARKDOWN):
 • <3–7 bullets, only if needed>
 
 **Final Conclusion:** <2–3 lines, professional closing>
+
+IMPORTANT (MACHINE-READABLE OUTPUTS):
+At the very end, output these three lines EXACTLY (single-line JSON each, no extra text after them):
+
+SCORES_JSON: {{"rating": X, "readiness": Y}}
+CONFIDENCE_JSON: {{"level":"High|Medium|Low","score": Z}}
+DIRECTION_SCORES_JSON: {{"N":0-100,"NE":0-100,"E":0-100,"SE":0-100,"S":0-100,"SW":0-100,"W":0-100,"NW":0-100,"CENTER":0-100}}
+
+Guidance:
+- rating is 0..10, readiness is 1..100
+- confidence score Z is 0..100
+- direction scores reflect overall directional harmony based on the plan (use 50 if truly unknown)
 """.strip()
 
     return prompt
@@ -382,76 +416,253 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
 
 
 # =========================
-# PDF Export (simple text rendering)
+# Premium Score UI (1: circular gauge, 4: confidence meter)
 # =========================
+def grade_label(value_0_100: int | None):
+    if value_0_100 is None:
+        return "Unknown"
+    if value_0_100 >= 85:
+        return "Excellent"
+    if value_0_100 >= 70:
+        return "Very Good"
+    if value_0_100 >= 55:
+        return "Balanced"
+    if value_0_100 >= 40:
+        return "Needs Improvement"
+    return "Weak Alignment"
+
+def circular_gauge(title: str, value: float | int | None, max_value: float, sublabel: str = ""):
+    """
+    Pure HTML/SVG gauge, avoids flaky parsing issues.
+    """
+    if value is None:
+        st.warning(f"{title}: not detected")
+        return
+
+    v = float(value)
+    v = max(0.0, min(max_value, v))
+    pct = v / max_value
+
+    # SVG circle math
+    r = 46
+    c = 2 * 3.14159265 * r
+    dash = pct * c
+    gap = c - dash
+
+    st.markdown(
+        f"""
+        <div style="border:1px solid rgba(49,51,63,.15); border-radius:14px; padding:12px 14px; background:white;">
+          <div style="font-weight:700; margin-bottom:8px;">{title}</div>
+          <div style="display:flex; gap:14px; align-items:center;">
+            <svg width="110" height="110" viewBox="0 0 120 120">
+              <circle cx="60" cy="60" r="{r}" stroke="rgba(49,51,63,.12)" stroke-width="12" fill="none"/>
+              <circle cx="60" cy="60" r="{r}" stroke="rgba(79,70,229,.95)" stroke-width="12" fill="none"
+                stroke-linecap="round"
+                stroke-dasharray="{dash:.2f} {gap:.2f}"
+                transform="rotate(-90 60 60)"/>
+              <text x="60" y="60" text-anchor="middle" dominant-baseline="central" style="font-size:22px; font-weight:800; fill:rgba(17,24,39,.92);">
+                {v:.0f}
+              </text>
+              <text x="60" y="82" text-anchor="middle" dominant-baseline="central" style="font-size:11px; fill:rgba(55,65,81,.75);">
+                / {max_value:.0f}
+              </text>
+            </svg>
+            <div>
+              <div style="font-size:14px; font-weight:800; color:rgba(17,24,39,.92);">{grade_label(int(round(pct*100)))}</div>
+              <div style="color:rgba(55,65,81,.75); font-size:12px;">{sublabel}</div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def confidence_meter(conf_level: str | None, conf_score: int | None):
+    """
+    Confidence card + bar. (4)
+    """
+    label = conf_level or "Unknown"
+    score = conf_score if conf_score is not None else None
+    if score is None:
+        # fallback from label
+        if label.lower() == "high":
+            score = 85
+        elif label.lower() == "medium":
+            score = 60
+        elif label.lower() == "low":
+            score = 35
+        else:
+            score = None
+
+    if score is None:
+        st.warning("Confidence: not detected")
+        return
+
+    score = int(max(0, min(100, score)))
+
+    st.markdown(
+        f"""
+        <div style="border:1px solid rgba(49,51,63,.15); border-radius:14px; padding:12px 14px; background:white;">
+          <div style="font-weight:700; margin-bottom:6px;">AI Confidence</div>
+          <div style="color:rgba(55,65,81,.75); font-size:12px; margin-bottom:10px;">
+            Level: <b>{label}</b> • Score: <b>{score}/100</b>
+          </div>
+          <div style="height:14px;background:rgba(49,51,63,.12);border-radius:999px;overflow:hidden;">
+            <div style="width:{score}%;height:100%;background:linear-gradient(90deg, rgba(79,70,229,.95), rgba(34,197,94,.85));"></div>
+          </div>
+          <div style="margin-top:8px; color:rgba(55,65,81,.7); font-size:12px;">
+            Higher confidence means room identification/orientation is clearer in the plan. Confirm missing details to improve reliability.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# =========================
+# Radar chart (2)
+# =========================
+def render_direction_radar(direction_scores: dict | None):
+    if not direction_scores:
+        st.info("Direction radar not available.")
+        return
+
+    order = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    vals = []
+    for k in order:
+        v = direction_scores.get(k, 50)
+        try:
+            v = float(v)
+        except Exception:
+            v = 50.0
+        vals.append(max(0.0, min(100.0, v)))
+
+    # close loop
+    angles = np.linspace(0, 2*np.pi, len(order), endpoint=False).tolist()
+    vals2 = vals + [vals[0]]
+    angles2 = angles + [angles[0]]
+
+    fig = plt.figure(figsize=(4.8, 4.2))
+    ax = plt.subplot(111, polar=True)
+    ax.plot(angles2, vals2, linewidth=2)
+    ax.fill(angles2, vals2, alpha=0.15)
+    ax.set_xticks(angles)
+    ax.set_xticklabels(order)
+    ax.set_yticks([20, 40, 60, 80, 100])
+    ax.set_yticklabels(["20", "40", "60", "80", "100"])
+    ax.set_title("Directional Harmony Radar (0–100)", pad=14)
+    st.pyplot(fig, clear_figure=True)
+
+
+# =========================
+# Heatmap overlay on floor plan (3)
+# =========================
+def score_to_color(score: float):
+    """
+    Map 0..100 to red->yellow->green.
+    """
+    s = max(0.0, min(100.0, float(score)))
+    # simple gradient: red -> yellow -> green
+    if s < 50:
+        # red to yellow
+        t = s / 50.0
+        r = 220
+        g = int(60 + (180 * t))
+        b = 60
+    else:
+        # yellow to green
+        t = (s - 50.0) / 50.0
+        r = int(220 - (140 * t))
+        g = 220
+        b = 80
+    return (r, g, b)
+
+def heatmap_overlay_on_image(image_bytes: bytes, direction_scores: dict):
+    """
+    Creates a 3x3 grid overlay on the image:
+      NW  N  NE
+       W  C   E
+      SW  S  SE
+    Each cell colored based on direction score.
+    """
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    w, h = img.size
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # map cells
+    grid = [
+        ["NW", "N", "NE"],
+        ["W", "CENTER", "E"],
+        ["SW", "S", "SE"],
+    ]
+
+    cell_w = w / 3.0
+    cell_h = h / 3.0
+
+    for r in range(3):
+        for c in range(3):
+            key = grid[r][c]
+            score = direction_scores.get(key, 50)
+            col = score_to_color(score)
+            alpha = 85  # transparency
+            x0 = int(c * cell_w)
+            y0 = int(r * cell_h)
+            x1 = int((c + 1) * cell_w)
+            y1 = int((r + 1) * cell_h)
+            draw.rectangle([x0, y0, x1, y1], fill=(col[0], col[1], col[2], alpha))
+
+    # grid lines
+    line_alpha = 110
+    for i in [1, 2]:
+        draw.line([int(i*cell_w), 0, int(i*cell_w), h], fill=(255, 255, 255, line_alpha), width=3)
+        draw.line([0, int(i*cell_h), w, int(i*cell_h)], fill=(255, 255, 255, line_alpha), width=3)
+
+    out = Image.alpha_composite(img, overlay)
+    out_buf = io.BytesIO()
+    out.save(out_buf, format="PNG")
+    out_buf.seek(0)
+    return out_buf.getvalue()
+
+
+# =========================
+# High-quality PDF renderer
+# =========================
+def _esc(s: str) -> str:
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;"))
+
+def _is_table_line(line: str) -> bool:
+    return line.strip().startswith("|") and line.strip().endswith("|")
+
+def _parse_md_table(lines: list[str], start_idx: int):
+    table_lines = []
+    i = start_idx
+    while i < len(lines) and _is_table_line(lines[i]):
+        table_lines.append(lines[i].strip())
+        i += 1
+
+    rows = []
+    for tl in table_lines:
+        parts = [p.strip() for p in tl.strip("|").split("|")]
+        rows.append(parts)
+
+    # remove separator row |---|---|
+    cleaned = []
+    for r in rows:
+        if all(set(c) <= set("-:") and "-" in c for c in r):
+            continue
+        cleaned.append(r)
+
+    return cleaned, i
 
 def make_pdf_bytes(title: str, md_report: str) -> bytes:
-    """
-    High-quality PDF rendering:
-    - Parses Markdown headings, bullet lines, and Markdown tables
-    - Renders tables using ReportLab Table (grid)
-    - Produces a clean, professional PDF similar to the sample format
-    """
-    import io
-    import re
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-    )
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib import colors
-
-    # ---- helpers ----
-    def esc(s: str) -> str:
-        # minimal XML escape for Paragraph
-        return (s.replace("&", "&amp;")
-                 .replace("<", "&lt;")
-                 .replace(">", "&gt;"))
-
-    def is_table_line(line: str) -> bool:
-        return line.strip().startswith("|") and line.strip().endswith("|")
-
-    def parse_md_table(lines: list[str], start_idx: int):
-        """
-        Parses a Markdown table block starting at start_idx.
-        Returns (table_data, next_index)
-        """
-        table_lines = []
-        i = start_idx
-        while i < len(lines) and is_table_line(lines[i]):
-            table_lines.append(lines[i].strip())
-            i += 1
-
-        # Convert markdown table lines to cells
-        rows = []
-        for tl in table_lines:
-            # split by |, discard empty ends
-            parts = [p.strip() for p in tl.strip("|").split("|")]
-            rows.append(parts)
-
-        # Remove separator row like |---|---|
-        cleaned = []
-        for r in rows:
-            if all(re.fullmatch(r"-{3,}", c.replace(":", "").replace("-", "-")) or re.fullmatch(r":?-{3,}:?", c) for c in r):
-                continue
-            # also catch typical --- separator row
-            if all(set(c) <= set("-:") and "-" in c for c in r):
-                continue
-            cleaned.append(r)
-
-        return cleaned, i
-
-    # ---- normalize input ----
-    md = md_report or ""
-    md = md.strip()
-
-    # remove any code fences just in case
-    md = re.sub(r"^\s*```[a-zA-Z]*\s*\n", "", md)
-    md = re.sub(r"\n\s*```\s*$", "", md)
+    md = (md_report or "").strip()
+    md = sanitize_report_text(md)
 
     lines = md.splitlines()
 
-    # ---- document ----
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf,
@@ -467,55 +678,40 @@ def make_pdf_bytes(title: str, md_report: str) -> bytes:
     h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=12, spaceBefore=10, spaceAfter=6)
     h3 = ParagraphStyle("H3", parent=styles["Heading3"], fontSize=11, spaceBefore=8, spaceAfter=4)
     body = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10, leading=13, spaceAfter=3)
-    small = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=9, leading=12, textColor=colors.grey)
 
     story = []
-
-    # Top Title (like sample)
-    story.append(Paragraph(esc(title), h1))
+    story.append(Paragraph(_esc(title), h1))
     story.append(Spacer(1, 6))
 
-    # ---- iterate & render ----
     i = 0
     while i < len(lines):
         line = lines[i].rstrip()
 
-        # skip blank
         if not line.strip():
             story.append(Spacer(1, 6))
             i += 1
             continue
 
-        # horizontal rule
         if line.strip() == "---":
             story.append(Spacer(1, 8))
             i += 1
             continue
 
-        # markdown table
-        if is_table_line(line):
-            table_data, next_i = parse_md_table(lines, i)
+        if _is_table_line(line):
+            table_data, next_i = _parse_md_table(lines, i)
             if table_data:
-                # make column widths reasonable
-                # clamp cols to max 3 typical in your report
                 col_count = max(len(r) for r in table_data)
-                # pad rows
                 for r in table_data:
                     while len(r) < col_count:
                         r.append("")
 
-                # Convert to Paragraphs for wrapping
                 table_para = []
                 for r in table_data:
-                    table_para.append([Paragraph(esc(c), body) for c in r])
+                    table_para.append([Paragraph(_esc(c), body) for c in r])
 
                 t = Table(table_para, hAlign="LEFT")
-
                 t.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                    ("LINEABOVE", (0, 0), (-1, 0), 1, colors.black),
-                    ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -526,46 +722,41 @@ def make_pdf_bytes(title: str, md_report: str) -> bytes:
                 ]))
                 story.append(t)
                 story.append(Spacer(1, 10))
-
             i = next_i
             continue
 
-        # Headings
         if line.startswith("# "):
-            story.append(Paragraph(esc(line[2:].strip()), h1))
+            story.append(Paragraph(_esc(line[2:].strip()), h1))
             i += 1
             continue
         if line.startswith("## "):
-            story.append(Paragraph(esc(line[3:].strip()), h2))
+            story.append(Paragraph(_esc(line[3:].strip()), h2))
             i += 1
             continue
         if line.startswith("### "):
-            story.append(Paragraph(esc(line[4:].strip()), h3))
+            story.append(Paragraph(_esc(line[4:].strip()), h3))
             i += 1
             continue
 
-        # Bullet lines: • ...  OR - ...
+        # bullets
         if line.strip().startswith("• "):
-            story.append(Paragraph("• " + esc(line.strip()[2:]), body))
+            story.append(Paragraph("• " + _esc(line.strip()[2:]), body))
             i += 1
             continue
         if line.strip().startswith("- "):
-            story.append(Paragraph("• " + esc(line.strip()[2:]), body))
+            story.append(Paragraph("• " + _esc(line.strip()[2:]), body))
             i += 1
             continue
 
-        # Bold inline support for your report: **text**
-        # Convert **x** -> <b>x</b> for Paragraph
-        safe = esc(line)
+        # bold inline
+        safe = _esc(line)
         safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe)
-
         story.append(Paragraph(safe, body))
         i += 1
 
     doc.build(story)
     buf.seek(0)
     return buf.read()
-
 
 
 # =========================
@@ -588,12 +779,13 @@ with left:
     st.markdown('<div class="small-note">Tip: Keep video short. We sample a few frames (cost-optimized).</div>',
                 unsafe_allow_html=True)
 
+    uploaded_is_pdf = False
     if uploaded:
-        if uploaded.name.lower().endswith(".pdf"):
+        uploaded_is_pdf = uploaded.name.lower().endswith(".pdf")
+        if uploaded_is_pdf:
             st.info(f"📄 Floor plan PDF uploaded: **{uploaded.name}** ({bytes_to_mb(uploaded.size):.1f} MB)")
         else:
-            st.image(uploaded, caption=f"{uploaded.name} ({bytes_to_mb(uploaded.size):.1f} MB)",
-                     use_container_width=True)
+            st.image(uploaded, caption=f"{uploaded.name} ({bytes_to_mb(uploaded.size):.1f} MB)", use_container_width=True)
 
     if video:
         st.video(video)
@@ -647,7 +839,6 @@ with right:
         height=90
     )
 
-    # Resident profile (Vastu-only)
     st.markdown("### 6) Resident profile (Vastu-only personalization)")
     st.caption("Used only to prioritize recommendations and space allocation. No astrology.")
 
@@ -700,6 +891,7 @@ with right:
             f"📦 Upload limit: {MAX_FILE_MB} MB per file"
         )
 
+    st.markdown("### 7) Generate")
     c1, c2 = st.columns([1, 1])
     show = c1.button("✨ Generate Vastu Report", type="primary", use_container_width=True)
     clear = c2.button("🧹 Clear", use_container_width=True)
@@ -707,6 +899,7 @@ with right:
 if clear:
     st.session_state["out"] = ""
     st.session_state["err"] = ""
+    st.session_state["meta"] = {}
 
 
 # =========================
@@ -715,6 +908,7 @@ if clear:
 if show:
     st.session_state["err"] = ""
     st.session_state["out"] = ""
+    st.session_state["meta"] = {}
 
     try:
         if not uploaded:
@@ -757,7 +951,22 @@ if show:
             with st.spinner("Generating report..."):
                 try:
                     resp = run_openai(uploaded, prompt_text, video_file=video_to_send)
-                    st.session_state["out"] = sanitize_report_text(resp.output_text or "")
+                    raw = sanitize_report_text(resp.output_text or "")
+
+                    # Parse machine-readable blocks
+                    scores = extract_json_block("SCORES", raw)
+                    conf = extract_json_block("CONFIDENCE", raw)
+                    dirs = extract_json_block("DIRECTION_SCORES", raw)
+
+                    st.session_state["meta"] = {
+                        "scores": scores or {},
+                        "confidence": conf or {},
+                        "direction_scores": dirs or {},
+                    }
+
+                    # Remove JSON blocks from the visible report
+                    cleaned_report = strip_json_blocks(raw)
+                    st.session_state["out"] = cleaned_report.strip()
                 finally:
                     loading_panel.empty()
 
@@ -777,44 +986,75 @@ if show:
 # Output
 # =========================
 st.markdown('<hr class="vs-hr"/>', unsafe_allow_html=True)
-st.markdown("### 📄 VastuSense Output")
+st.markdown("## 📄 VastuSense Output")
 
 if st.session_state["err"]:
     st.error(st.session_state["err"])
 
 if st.session_state["out"]:
     report_md = st.session_state["out"]
+    meta = st.session_state.get("meta", {}) or {}
+    scores = meta.get("scores", {}) or {}
+    conf = meta.get("confidence", {}) or {}
+    direction_scores = meta.get("direction_scores", {}) or {}
 
-    # --- Score UI ("graphic ruler") ---
-    readiness = extract_readiness_1_100(report_md)
-    overall_0_10 = extract_overall_rating_0_10(report_md)
+    # ---- Premium score UI (1 + 4) ----
+    st.markdown("### 📊 Consultant Scorecard")
+    a, b, c = st.columns([1, 1, 1])
 
-    st.markdown("#### ✅ Scores")
-    c1, c2 = st.columns(2)
-    with c1:
-        if readiness is not None:
-            st.metric("Vastu Readiness Score", f"{readiness}/100")
-            st.progress(readiness / 100.0)
-        else:
-            st.info("Readiness score not detected (expected: 'Vastu Readiness Score (1–100): <number>').")
+    rating = scores.get("rating", None)
+    readiness = scores.get("readiness", None)
 
-    with c2:
-        if overall_0_10 is not None:
-            st.metric("Overall Rating", f"{overall_0_10:.1f}/10")
-            st.progress(overall_0_10 / 10.0)
-        else:
-            st.info("Overall rating not detected (expected: 'Overall Rating: X / 10').")
+    # normalize numeric types
+    try:
+        rating = float(rating) if rating is not None else None
+    except Exception:
+        rating = None
+    try:
+        readiness = int(readiness) if readiness is not None else None
+    except Exception:
+        readiness = None
 
-    # Render report (Markdown with tables)
-    st.markdown("#### 🧾 Full Report (Aligned + Table Format)")
+    conf_level = conf.get("level", None)
+    conf_score = conf.get("score", None)
+    try:
+        conf_score = int(conf_score) if conf_score is not None else None
+    except Exception:
+        conf_score = None
+
+    with a:
+        circular_gauge("Overall Rating", rating, 10, "Overall Vastu balance (0–10)")
+
+    with b:
+        circular_gauge("Readiness Score", readiness, 100, "Overall readiness (1–100)")
+
+    with c:
+        confidence_meter(conf_level, conf_score)
+
+    # ---- Direction radar (2) ----
+    st.markdown("### 🧭 Directional Harmony (Radar)")
+    render_direction_radar(direction_scores)
+
+    # ---- Heatmap overlay (3) ----
+    st.markdown("### 🗺️ Floor Plan Vastu Heatmap (Directional Overlay)")
+    if uploaded and (not uploaded.name.lower().endswith(".pdf")) and direction_scores:
+        try:
+            img_bytes = uploaded.getvalue()
+            overlay_png = heatmap_overlay_on_image(img_bytes, direction_scores)
+            st.image(overlay_png, caption="Overlay shows directional harmony (green higher, red lower).", use_container_width=True)
+        except Exception as ex:
+            st.info(f"Heatmap overlay could not be generated for this image. ({ex})")
+    else:
+        st.info("Heatmap overlay is available for image uploads (PNG/JPG/WEBP). For PDFs, please upload an image export of the plan.")
+
+    # ---- Report (Markdown with tables) ----
+    st.markdown("### 🧾 Full Report")
     st.markdown('<div class="vs-card">', unsafe_allow_html=True)
     st.markdown(report_md)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("#### 📋 Copy-ready report")
-    st.text_area("Copy/paste", report_md, height=280)
-
-    st.markdown("#### ⬇️ Download")
+    # ---- Download PDF ----
+    st.markdown("### ⬇️ Download")
     pdf_bytes = make_pdf_bytes("VastuSense Report", report_md)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     st.download_button(
@@ -824,3 +1064,21 @@ if st.session_state["out"]:
         mime="application/pdf",
         use_container_width=True
     )
+
+
+# =========================
+# requirements.txt (for your repo)
+# =========================
+# streamlit
+# openai
+# reportlab
+# opencv-python-headless
+# pandas
+# pillow
+# numpy
+# matplotlib
+#
+# Also enforce 50MB UI/server limit:
+# .streamlit/config.toml
+# [server]
+# maxUploadSize = 50
