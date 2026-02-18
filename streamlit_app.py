@@ -428,7 +428,6 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
     resp = client.responses.create(
         model=MODEL,
         reasoning={"effort": "high"},
-        temperature=0,
         max_output_tokens=MAX_OUTPUT_TOKENS,
         input=[{"role": "user", "content": content}],
     )
