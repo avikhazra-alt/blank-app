@@ -21,16 +21,15 @@ import pandas as pd
 # =========================
 st.set_page_config(page_title="VastuSense Demo", layout="wide")
 
-MODEL = "gpt-4o"                # as per your choice
-MAX_OUTPUT_TOKENS = 2600        # higher for professional template + resident sections
+MODEL = "gpt-4o"
+MAX_OUTPUT_TOKENS = 2800
 VIDEO_MAX_FRAMES = 8
 MAX_FILE_MB = 50
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
-# Option-2 loading GIF (small panel on right)
 LOADING_GIF_PATH = "assets/vastu_loading.gif"
 
-client = OpenAI()  # OPENAI_API_KEY must be set via env or Streamlit secrets
+client = OpenAI()  # OPENAI_API_KEY must be set
 
 
 # =========================
@@ -42,7 +41,6 @@ st.markdown(
       .vs-card { padding: 16px 18px; border-radius: 14px; border: 1px solid rgba(49,51,63,.15); background: white; }
       .vs-subtle { color: rgba(49,51,63,.7); font-size: 0.95rem; }
       .vs-hr { margin: 18px 0; }
-
       .small-note { font-size: 0.9rem; color: rgba(49,51,63,.65); }
 
       .loading-panel {
@@ -51,14 +49,14 @@ st.markdown(
         background: white;
         padding: 12px 14px;
       }
-      .loading-title {
-        font-weight: 700;
-        margin: 0 0 6px 0;
-      }
-      .loading-sub {
-        color: rgba(49,51,63,.7);
-        font-size: 0.92rem;
-        margin: 0 0 8px 0;
+      .loading-title { font-weight: 700; margin: 0 0 6px 0; }
+      .loading-sub { color: rgba(49,51,63,.7); font-size: 0.92rem; margin: 0 0 8px 0; }
+
+      .report-pre {
+        white-space: pre-wrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        line-height: 1.35;
+        font-size: 0.95rem;
       }
     </style>
     """,
@@ -71,10 +69,8 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Session state
 st.session_state.setdefault("out", "")
 st.session_state.setdefault("err", "")
-st.session_state.setdefault("usage", None)
 
 
 # =========================
@@ -142,9 +138,49 @@ def extract_video_frames_as_dataurls(video_bytes: bytes, max_frames: int = 8):
 
     return data_urls
 
+def sanitize_report_text(text: str) -> str:
+    """
+    Removes code fences like:
+    ```plaintext
+    ...
+    ```
+    and trims junk.
+    """
+    if not text:
+        return ""
+
+    t = text.strip()
+
+    # Remove starting fence ``` or ```plaintext / ```markdown etc.
+    t = re.sub(r"^\s*```[a-zA-Z]*\s*\n", "", t)
+
+    # Remove ending fence ```
+    t = re.sub(r"\n\s*```\s*$", "", t)
+
+    # Remove any stray standalone "plaintext" lines
+    t = re.sub(r"^\s*plaintext\s*$", "", t, flags=re.MULTILINE)
+
+    return t.strip()
+
+def extract_overall_rating_0_10(report: str):
+    # matches: Overall Rating: 8 / 10
+    m = re.search(r"Overall\s+Rating\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*10", report, flags=re.IGNORECASE)
+    if not m:
+        return None
+    v = float(m.group(1))
+    return max(0.0, min(10.0, v))
+
+def extract_readiness_1_100(report: str):
+    # matches: Vastu Readiness Score (1–100): 78  OR (1-100)
+    m = re.search(r"Vastu\s+Readiness\s+Score\s*\(1[–-]100\)\s*:\s*([0-9]{1,3})", report, flags=re.IGNORECASE)
+    if not m:
+        return None
+    v = int(m.group(1))
+    return max(1, min(100, v))
+
 
 # =========================
-# Prompt Builder (PDF-style + resident-aware)
+# Prompt Builder (PDF-like + tables)
 # =========================
 DIRECTION_ELEMENT_CONTROLS = [
     ("North-East", "Water", "Health, clarity, spirituality"),
@@ -157,18 +193,9 @@ DIRECTION_ELEMENT_CONTROLS = [
     ("North", "Water", "Career, flow of money"),
 ]
 
-GOAL_EXPLANATIONS = {
-    "Health": "ventilation, dampness control, clean water areas, kitchen/toilet hygiene, daylight",
-    "Sleep": "bed placement, mirror control, clutter reduction, calming light, noise/visual load",
-    "Career/Focus": "study/work desk placement, stable back support, north/east light, distraction control",
-    "Relationships": "stable seating, bedroom harmony, clutter control, balanced zones",
-    "Finance": "leakage control, north flow, SW stability, tidy storage and circulation",
-    "Peace of mind": "NE lightness, open circulation, declutter, calm lighting",
-}
-
 def build_resident_context(primary: dict, others: list[dict]) -> str:
     lines = []
-    lines.append("Primary Resident (for personalization, Vastu-only — no astrology):")
+    lines.append("Primary Resident (Vastu-only personalization):")
     lines.append(f"- Name: {primary.get('name') or 'Not provided'}")
     lines.append(f"- Age group: {primary.get('age_group')}")
     lines.append(f"- Work/Lifestyle: {primary.get('work_style')}")
@@ -185,12 +212,6 @@ def build_resident_context(primary: dict, others: list[dict]) -> str:
             lines.append(f"{i}) Relation: {r.get('relation')}, Age group: {r.get('age_group')}, Needs: {r.get('needs') or 'None'}")
     else:
         lines.append("\nAdditional Permanent Residents: None")
-
-    lines.append("\nGoal Interpretation (how to prioritize recommendations):")
-    for g in primary.get("goals", []):
-        expl = GOAL_EXPLANATIONS.get(g)
-        if expl:
-            lines.append(f"- {g}: focus on {expl}")
 
     return "\n".join(lines)
 
@@ -210,112 +231,116 @@ def build_user_prompt(
     primary_resident: dict,
     other_residents: list[dict],
 ) -> str:
-    direction_block = "\n".join([f"{d} — {e} — {c}" for d, e, c in DIRECTION_ELEMENT_CONTROLS])
+    # Build markdown table for direction controls
+    dir_table = ["| Direction | Element | Controls |", "|---|---|---|"]
+    for d, e, c in DIRECTION_ELEMENT_CONTROLS:
+        dir_table.append(f"| {d} | {e} | {c} |")
+    dir_table_md = "\n".join(dir_table)
 
     loc_block = ""
     if lat is not None and lon is not None and not (lat == 0.0 and lon == 0.0):
-        loc_block = f"""
-Property Location (optional):
-- Latitude: {lat}
-- Longitude: {lon}
-Use this only to improve orientation context and daylight considerations.
-""".strip()
+        loc_block = f"- Location: {lat}, {lon} (optional)"
 
     resident_block = build_resident_context(primary_resident, other_residents)
 
     prompt = f"""
 You are a professional Vastu consultant writing a client-facing report.
 
-SCOPE RULES (important):
-- This is VASTU analysis only. Do NOT do birth chart / astrology analysis.
-- Resident profile is used ONLY to personalize priorities, room allocation, and practical remedies.
-- If a detail is not visible in the plan, say "Not determined from the plan" and add it under “Questions for Confirmation”.
+STRICT RULES:
+- Vastu-only analysis. Do NOT do astrology/birth charts.
+- Output MUST be clean Markdown WITHOUT any code fences (no ```plaintext, no ```).
+- Follow the exact structure below. Keep alignment neat.
 
-INPUTS (treat these as ground truth where provided):
+GROUND TRUTH INPUTS:
 - Property Type: {property_type}
 - Client: {client_name}
 - Home Type: {home_type}
 - North on plan: {north_on_plan}
-- Entrance Direction: {entrance_direction}
-- Entrance Movement: {entrance_movement}
+- Entrance Direction: {entrance_direction} ({entrance_movement})
 - House Alignment: {house_alignment}
 - Advice Style: {advice_style}
 {loc_block}
 
-RESIDENT PROFILE (for personalization; Vastu-only, no astrology):
+RESIDENT PROFILE (use ONLY to prioritize recommendations / room allocation):
 {resident_block}
 
-ADDITIONAL USER INFORMATION (optional):
+ADDITIONAL INFORMATION:
 {additional_info.strip() if additional_info and additional_info.strip() else "None"}
 
-ANALYSIS SOURCE:
-- Use the uploaded floor plan (and optional walkthrough frames if provided).
-- Do not ask for higher resolution; operate on the given plan.
+OUTPUT FORMAT (STRICT MARKDOWN):
 
-OUTPUT FORMAT (STRICT — follow this structure and level of detail):
-Use plain text with headings and numbered sections exactly like below.
-Use bullet points with "•". Keep it professional and consultant-grade.
+# VASTU SENSE
+## Full Vastu Analysis Report
 
-VASTU SENSE
-Full Vastu Analysis Report
-Property Type: {property_type}
-Client: {client_name}
-Entrance Direction: {entrance_direction} ({entrance_movement})
-House Alignment: {house_alignment}
+### Property Summary
+| Field | Value |
+|---|---|
+| Property Type | {property_type} |
+| Client | {client_name} |
+| Entrance Direction | {entrance_direction} ({entrance_movement}) |
+| House Alignment | {house_alignment} |
+| North on plan | {north_on_plan} |
+| Advice Style | {advice_style} |
 
-1. Overall Energy Map
-Direction Element Controls
-{direction_block}
-Overall Vastu Balance: <1–2 lines>
-Overall Rating: <X / 10>
-Vastu Readiness Score (1–100): <integer 1..100>
+---
 
-2. Entrance Analysis
+## 1. Overall Energy Map
+### Direction Element Controls
+{dir_table_md}
+
+**Overall Vastu Balance:** <1–2 lines>  
+**Overall Rating:** <X / 10>  
+**Vastu Readiness Score (1–100):** <integer 1..100>
+
+---
+
+## 2. Entrance Analysis
 • <3–6 bullets>
 
-3. Living Room (mention zone/direction if you can infer)
+## 3. Living Room (mention zone/direction if you can infer)
 • <3–6 bullets>
 
-4. Dining Area
+## 4. Dining Area
 • <2–4 bullets>
 
-5. Kitchen (mention zone/direction if you can infer)
+## 5. Kitchen (mention zone/direction if you can infer)
 • <4–7 bullets>
 
-6. Master Bedroom (mention zone/direction if you can infer)
+## 6. Master Bedroom (mention zone/direction if you can infer)
 • <3–6 bullets>
 
-7. Other Bedrooms
+## 7. Other Bedrooms
 • <3–6 bullets>
 
-8. Toilets
+## 8. Toilets
 • <3–6 bullets>
 
-9. Balconies
+## 9. Balconies
 • <2–4 bullets>
 
-10. Financial & Relationship Energy
+## 10. Financial & Relationship Energy
 • <2–4 bullets>
 
-11. Health & Mental Peace
+## 11. Health & Mental Peace
 • <2–4 bullets>
 
-12. Resident-Based Space Allocation (Personalized Vastu Plan)
-• Clearly recommend which room should be master, which room for children/parents, and where the work/study setup should be.
-• Tie recommendations to resident age group + goals (Health/Sleep/Career/Focus/Finance/Peace of mind).
-• If room identity is unclear, give best-guess options + ask for confirmation.
+## 12. Resident-Based Space Allocation (Personalized Vastu Plan)
+• Recommend room allocation for primary resident and others (based on goals + age group).
+• If unclear from plan, provide best-guess options + add questions.
 
-13. Lifestyle-Compatible Remedies (Non-structural, Practical)
-• Provide remedies aligned to resident priorities (sleep/study/health, etc.)
-• Keep remedies feasible (no heavy reconstruction).
+## 13. Lifestyle-Compatible Remedies (Non-structural, Practical)
+• Remedies aligned to resident priorities.
+• No heavy reconstruction.
 
-Major Remedies Summary
+---
+
+## Major Remedies Summary
 • <4–7 bullets>
 
-Questions for Confirmation
+## Questions for Confirmation
 • <3–7 bullets, only if needed>
 
-Final Conclusion: <2–3 lines, professional closing>
+**Final Conclusion:** <2–3 lines, professional closing>
 """.strip()
 
     return prompt
@@ -357,9 +382,22 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
 
 
 # =========================
-# PDF Export
+# PDF Export (simple text rendering)
 # =========================
-def make_pdf_bytes(title: str, plain_report: str) -> bytes:
+def make_pdf_bytes(title: str, md_report: str) -> bytes:
+    """
+    We render Markdown as plain text into PDF (simple + robust).
+    Tables will appear as text, but still readable.
+    """
+    # crude markdown cleanup
+    plain = md_report
+    plain = re.sub(r"\|", " | ", plain)
+    plain = re.sub(r"^\s*#\s*", "", plain, flags=re.MULTILINE)
+    plain = re.sub(r"^\s*##\s*", "", plain, flags=re.MULTILINE)
+    plain = re.sub(r"^\s*###\s*", "", plain, flags=re.MULTILINE)
+    plain = plain.replace("**", "")
+    plain = plain.replace("---", "")
+
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -374,7 +412,7 @@ def make_pdf_bytes(title: str, plain_report: str) -> bytes:
     c.setFont("Helvetica", 10)
 
     lines = []
-    for para in plain_report.split("\n"):
+    for para in plain.split("\n"):
         if not para.strip():
             lines.append("")
             continue
@@ -432,7 +470,6 @@ with left:
         st.caption(f"🎥 Video size: {bytes_to_mb(video.size):.1f} MB")
 
 with right:
-    # Option 2: right-side small loading box placeholder
     loading_panel = st.empty()
 
     st.markdown("### 2) Report header inputs")
@@ -441,9 +478,12 @@ with right:
     property_type = h2.text_input("Property type", value="Residential Apartment")
 
     h3, h4 = st.columns(2)
-    entrance_direction = h3.selectbox("Entrance direction", ["Unknown", "East", "West", "North", "South", "NE", "NW", "SE", "SW"], index=1)
+    entrance_direction = h3.selectbox(
+        "Entrance direction",
+        ["Unknown", "East", "West", "North", "South", "NE", "NW", "SE", "SW"],
+        index=2
+    )
     entrance_movement = h4.text_input("Entrance movement text", value="movement West → East")
-
     house_alignment = st.text_input("House alignment text", value="East–South orientation")
 
     st.markdown("### 3) Quick inputs (recommended)")
@@ -474,14 +514,12 @@ with right:
     additional_info = st.text_area(
         "Helps improve accuracy",
         placeholder="Example: exact entrance location, constraints (cannot move kitchen), preferences (minimal changes)…",
-        height=100
+        height=90
     )
 
-    # -------------------------
-    # Resident Profile (Vastu-only)
-    # -------------------------
+    # Resident profile (Vastu-only)
     st.markdown("### 6) Resident profile (Vastu-only personalization)")
-    st.caption("Used only to prioritize recommendations and space allocation. No birth chart / astrology.")
+    st.caption("Used only to prioritize recommendations and space allocation. No astrology.")
 
     r1, r2 = st.columns(2)
     primary_resident_name = r1.text_input("Primary resident name (optional)", value="")
@@ -499,8 +537,8 @@ with right:
     if len(primary_goals) > 4:
         st.warning("Please select up to 4 goals for cleaner prioritization.")
 
-    primary_constraints = st.text_input("Constraints (optional)", placeholder="e.g., No structural changes, Cannot move kitchen, Budget cap, etc.")
-    primary_notes = st.text_area("Notes (optional)", placeholder="e.g., senior mobility, kids study priority, sleep issues, etc.", height=70)
+    primary_constraints = st.text_input("Constraints (optional)", placeholder="e.g., No structural changes, Cannot move kitchen")
+    primary_notes = st.text_area("Notes (optional)", placeholder="e.g., senior mobility, kids study priority, sleep issues", height=60)
 
     st.markdown("#### Additional permanent residents (optional)")
     num_residents = st.number_input("How many additional residents?", min_value=0, max_value=5, value=0, step=1)
@@ -514,7 +552,6 @@ with right:
         needs = c.text_input(f"Special needs #{i+1} (optional)", key=f"needs_{i}", placeholder="e.g., study focus, mobility, allergies")
         other_residents.append({"relation": rel, "age_group": ag, "needs": needs})
 
-    # Build resident objects
     primary_resident = {
         "name": primary_resident_name.strip(),
         "age_group": primary_age_group,
@@ -525,7 +562,6 @@ with right:
         "notes": primary_notes.strip(),
     }
 
-    # Info box
     if uploaded:
         st.info(
             f"✅ Floor plan: {uploaded.name}\n"
@@ -541,7 +577,6 @@ with right:
 if clear:
     st.session_state["out"] = ""
     st.session_state["err"] = ""
-    st.session_state["usage"] = None
 
 
 # =========================
@@ -550,7 +585,6 @@ if clear:
 if show:
     st.session_state["err"] = ""
     st.session_state["out"] = ""
-    st.session_state["usage"] = None
 
     try:
         if not uploaded:
@@ -577,7 +611,7 @@ if show:
 
             video_to_send = video if (include_video and video is not None) else None
 
-            # Option 2: show GIF in a small right-panel card
+            # Right-side small loading box
             try:
                 loading_panel.markdown(
                     "<div class='loading-panel'>"
@@ -593,8 +627,7 @@ if show:
             with st.spinner("Generating report..."):
                 try:
                     resp = run_openai(uploaded, prompt_text, video_file=video_to_send)
-                    st.session_state["out"] = (resp.output_text or "").strip()
-                    st.session_state["usage"] = getattr(resp, "usage", None)
+                    st.session_state["out"] = sanitize_report_text(resp.output_text or "")
                 finally:
                     loading_panel.empty()
 
@@ -620,18 +653,39 @@ if st.session_state["err"]:
     st.error(st.session_state["err"])
 
 if st.session_state["out"]:
-    report_text = st.session_state["out"]
+    report_md = st.session_state["out"]
 
-    st.markdown("#### 🧾 Full Report (Template Style + Resident-Aware)")
+    # --- Score UI ("graphic ruler") ---
+    readiness = extract_readiness_1_100(report_md)
+    overall_0_10 = extract_overall_rating_0_10(report_md)
+
+    st.markdown("#### ✅ Scores")
+    c1, c2 = st.columns(2)
+    with c1:
+        if readiness is not None:
+            st.metric("Vastu Readiness Score", f"{readiness}/100")
+            st.progress(readiness / 100.0)
+        else:
+            st.info("Readiness score not detected (expected: 'Vastu Readiness Score (1–100): <number>').")
+
+    with c2:
+        if overall_0_10 is not None:
+            st.metric("Overall Rating", f"{overall_0_10:.1f}/10")
+            st.progress(overall_0_10 / 10.0)
+        else:
+            st.info("Overall rating not detected (expected: 'Overall Rating: X / 10').")
+
+    # Render report (Markdown with tables)
+    st.markdown("#### 🧾 Full Report (Aligned + Table Format)")
     st.markdown('<div class="vs-card">', unsafe_allow_html=True)
-    st.text(report_text)
+    st.markdown(report_md)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("#### 📋 Copy-ready report")
-    st.text_area("Copy/paste this into WhatsApp / Email", report_text, height=280)
+    st.text_area("Copy/paste", report_md, height=280)
 
     st.markdown("#### ⬇️ Download")
-    pdf_bytes = make_pdf_bytes("VastuSense Report", report_text)
+    pdf_bytes = make_pdf_bytes("VastuSense Report", report_md)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     st.download_button(
         label="📄 Download Report as PDF",
