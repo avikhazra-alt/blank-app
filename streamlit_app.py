@@ -384,58 +384,188 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
 # =========================
 # PDF Export (simple text rendering)
 # =========================
+
 def make_pdf_bytes(title: str, md_report: str) -> bytes:
     """
-    We render Markdown as plain text into PDF (simple + robust).
-    Tables will appear as text, but still readable.
+    High-quality PDF rendering:
+    - Parses Markdown headings, bullet lines, and Markdown tables
+    - Renders tables using ReportLab Table (grid)
+    - Produces a clean, professional PDF similar to the sample format
     """
-    # crude markdown cleanup
-    plain = md_report
-    plain = re.sub(r"\|", " | ", plain)
-    plain = re.sub(r"^\s*#\s*", "", plain, flags=re.MULTILINE)
-    plain = re.sub(r"^\s*##\s*", "", plain, flags=re.MULTILINE)
-    plain = re.sub(r"^\s*###\s*", "", plain, flags=re.MULTILINE)
-    plain = plain.replace("**", "")
-    plain = plain.replace("---", "")
+    import io
+    import re
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    )
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
 
+    # ---- helpers ----
+    def esc(s: str) -> str:
+        # minimal XML escape for Paragraph
+        return (s.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;"))
+
+    def is_table_line(line: str) -> bool:
+        return line.strip().startswith("|") and line.strip().endswith("|")
+
+    def parse_md_table(lines: list[str], start_idx: int):
+        """
+        Parses a Markdown table block starting at start_idx.
+        Returns (table_data, next_index)
+        """
+        table_lines = []
+        i = start_idx
+        while i < len(lines) and is_table_line(lines[i]):
+            table_lines.append(lines[i].strip())
+            i += 1
+
+        # Convert markdown table lines to cells
+        rows = []
+        for tl in table_lines:
+            # split by |, discard empty ends
+            parts = [p.strip() for p in tl.strip("|").split("|")]
+            rows.append(parts)
+
+        # Remove separator row like |---|---|
+        cleaned = []
+        for r in rows:
+            if all(re.fullmatch(r"-{3,}", c.replace(":", "").replace("-", "-")) or re.fullmatch(r":?-{3,}:?", c) for c in r):
+                continue
+            # also catch typical --- separator row
+            if all(set(c) <= set("-:") and "-" in c for c in r):
+                continue
+            cleaned.append(r)
+
+        return cleaned, i
+
+    # ---- normalize input ----
+    md = md_report or ""
+    md = md.strip()
+
+    # remove any code fences just in case
+    md = re.sub(r"^\s*```[a-zA-Z]*\s*\n", "", md)
+    md = re.sub(r"\n\s*```\s*$", "", md)
+
+    lines = md.splitlines()
+
+    # ---- document ----
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
 
-    margin = 0.7 * inch
-    y = height - margin
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=16, spaceAfter=10)
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=12, spaceBefore=10, spaceAfter=6)
+    h3 = ParagraphStyle("H3", parent=styles["Heading3"], fontSize=11, spaceBefore=8, spaceAfter=4)
+    body = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10, leading=13, spaceAfter=3)
+    small = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=9, leading=12, textColor=colors.grey)
 
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(margin, y, title)
-    y -= 18
+    story = []
 
-    c.setFont("Helvetica", 10)
+    # Top Title (like sample)
+    story.append(Paragraph(esc(title), h1))
+    story.append(Spacer(1, 6))
 
-    lines = []
-    for para in plain.split("\n"):
-        if not para.strip():
-            lines.append("")
+    # ---- iterate & render ----
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+
+        # skip blank
+        if not line.strip():
+            story.append(Spacer(1, 6))
+            i += 1
             continue
-        max_chars = 105
-        while len(para) > max_chars:
-            cut = para.rfind(" ", 0, max_chars)
-            if cut == -1:
-                cut = max_chars
-            lines.append(para[:cut].rstrip())
-            para = para[cut:].lstrip()
-        lines.append(para)
 
-    for line in lines:
-        if y <= margin:
-            c.showPage()
-            c.setFont("Helvetica", 10)
-            y = height - margin
-        c.drawString(margin, y, line[:1400])
-        y -= 14
+        # horizontal rule
+        if line.strip() == "---":
+            story.append(Spacer(1, 8))
+            i += 1
+            continue
 
-    c.save()
+        # markdown table
+        if is_table_line(line):
+            table_data, next_i = parse_md_table(lines, i)
+            if table_data:
+                # make column widths reasonable
+                # clamp cols to max 3 typical in your report
+                col_count = max(len(r) for r in table_data)
+                # pad rows
+                for r in table_data:
+                    while len(r) < col_count:
+                        r.append("")
+
+                # Convert to Paragraphs for wrapping
+                table_para = []
+                for r in table_data:
+                    table_para.append([Paragraph(esc(c), body) for c in r])
+
+                t = Table(table_para, hAlign="LEFT")
+
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                    ("LINEABOVE", (0, 0), (-1, 0), 1, colors.black),
+                    ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ]))
+                story.append(t)
+                story.append(Spacer(1, 10))
+
+            i = next_i
+            continue
+
+        # Headings
+        if line.startswith("# "):
+            story.append(Paragraph(esc(line[2:].strip()), h1))
+            i += 1
+            continue
+        if line.startswith("## "):
+            story.append(Paragraph(esc(line[3:].strip()), h2))
+            i += 1
+            continue
+        if line.startswith("### "):
+            story.append(Paragraph(esc(line[4:].strip()), h3))
+            i += 1
+            continue
+
+        # Bullet lines: • ...  OR - ...
+        if line.strip().startswith("• "):
+            story.append(Paragraph("• " + esc(line.strip()[2:]), body))
+            i += 1
+            continue
+        if line.strip().startswith("- "):
+            story.append(Paragraph("• " + esc(line.strip()[2:]), body))
+            i += 1
+            continue
+
+        # Bold inline support for your report: **text**
+        # Convert **x** -> <b>x</b> for Paragraph
+        safe = esc(line)
+        safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe)
+
+        story.append(Paragraph(safe, body))
+        i += 1
+
+    doc.build(story)
     buf.seek(0)
     return buf.read()
+
 
 
 # =========================
