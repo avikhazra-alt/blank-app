@@ -421,40 +421,41 @@ def run_openai(floorplan_file, prompt_text: str, video_file=None):
                 })
 
     # ---------- Strict schema output ----------
-    response_schema = {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "vastu_report",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "report_markdown": {"type": "string"},
-                    "scores": {
-                        "type": "object",
-                        "properties": {
-                            "rating": {"type": "number"},
-                            "readiness": {"type": "integer"}
-                        },
-                        "required": ["rating", "readiness"]
+response_schema = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "vastu_report",
+        "strict": True,   # 👈 ADD HERE
+        "schema": {
+            "type": "object",
+            "properties": {
+                "report_markdown": {"type": "string"},
+                "scores": {
+                    "type": "object",
+                    "properties": {
+                        "rating": {"type": "number"},
+                        "readiness": {"type": "integer"}
                     },
-                    "confidence": {
-                        "type": "object",
-                        "properties": {
-                            "level": {"type": "string"},
-                            "score": {"type": "integer"}
-                        },
-                        "required": ["level", "score"]
-                    },
-                    "direction_scores": {
-                        "type": "object",
-                        "additionalProperties": {"type": "integer"}
-                    }
+                    "required": ["rating", "readiness"]
                 },
-                "required": ["report_markdown","scores","confidence","direction_scores"]
-            }
+                "confidence": {
+                    "type": "object",
+                    "properties": {
+                        "level": {"type": "string"},
+                        "score": {"type": "integer"}
+                    },
+                    "required": ["level", "score"]
+                },
+                "direction_scores": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"}
+                }
+            },
+            "required": ["report_markdown","scores","confidence","direction_scores"]
         }
     }
+}
+
 
     resp = client.responses.create(
         model=MODEL,
